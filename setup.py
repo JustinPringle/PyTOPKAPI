@@ -36,7 +36,7 @@ def generate_version_py(filename):
 
     FULL_VERSION = VERSION
     if not ISRELEASED:
-        FULL_VERSION += '.dev-'
+        # FULL_VERSION += '.dev-'
         FULL_VERSION += GIT_REVISION[:7]
 
     cnt = """\
