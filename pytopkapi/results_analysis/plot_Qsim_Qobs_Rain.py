@@ -1,5 +1,5 @@
 import datetime as dt
-from configparser import SafeConfigParser
+from configparser import ConfigParser as SafeConfigParser
 
 import h5py
 import numpy as np

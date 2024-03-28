@@ -9,7 +9,7 @@ simulation based on the parameters specified in an INI file.
 import os.path
 import functools
 import multiprocessing as mp
-from configparser import SafeConfigParser
+from configparser import ConfigParser as SafeConfigParser
 from concurrent.futures import ProcessPoolExecutor, wait
 
 import h5py
