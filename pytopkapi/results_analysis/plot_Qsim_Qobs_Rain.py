@@ -121,7 +121,7 @@ def read_observed_flow(file_name):
     """Read the observed flow from a data file.
 
     """
-    date = np.loadtxt(file_name, dtype=np.int, usecols=(0, 1, 2, 3, 4))
+    date = np.loadtxt(file_name, dtype=np.int32, usecols=(0, 1, 2, 3, 4))
     dates = [dt.datetime(yr, mon, dy, hr, mn) for yr, mon, dy, hr, mn in date]
 
     Q = np.loadtxt(file_name, usecols=(5,))

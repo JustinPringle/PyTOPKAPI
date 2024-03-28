@@ -77,7 +77,7 @@ def extract_Q_channel(control_fname):
     tkpi_file.close()
 
     channel_mask = params[:, 3]
-    cond = params[:, 3]*np.ones(Qc.shape, dtype=np.int) != 1
+    cond = params[:, 3]*np.ones(Qc.shape, dtype=np.int32) != 1
 
     Qc = np.ma.masked_where(cond, Qc)
 
