@@ -11,7 +11,7 @@ from distutils.core import setup
 MAJOR               = 0
 MINOR               = 5
 MICRO               = 0
-ISRELEASED          = False
+ISRELEASED          = True
 VERSION             = '%d.%d.%d' % (MAJOR, MINOR, MICRO)
 
 dev_version_py = 'pytopkapi/__dev_version.py'
@@ -36,7 +36,7 @@ def generate_version_py(filename):
 
     FULL_VERSION = VERSION
     if not ISRELEASED:
-        # FULL_VERSION += '.dev-'
+        FULL_VERSION += '.dev-'
         FULL_VERSION += GIT_REVISION[:7]
 
     cnt = """\
