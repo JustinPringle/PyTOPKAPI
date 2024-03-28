@@ -1,0 +1,29 @@
+Metadata-Version: 2.1
+Name: PyTOPKAPI
+Version: 0.5.0
+Summary: TOPKAPI hydrological model in Python
+Home-page: http://sahg.github.io/PyTOPKAPI
+Download-URL: http://github.com/sahg/PyTOPKAPI/downloads
+Author: Scott Sinclair & Theo Vischel
+Author-email: theo.vischel@hmg.inpg.fr; sinclaird@ukzn.ac.za
+License: BSD
+Classifier: Development Status :: 4 - Beta
+Classifier: License :: OSI Approved :: BSD License
+Classifier: Environment :: Console
+Classifier: Operating System :: OS Independent
+Classifier: Intended Audience :: Science/Research
+Classifier: Programming Language :: Python
+Classifier: Topic :: Scientific/Engineering
+License-File: LICENSE
+
+PyTOPKAPI - a Python implementation of the TOPKAPI Hydrological model
+=====================================================================
+
+PyTOPKAPI is a BSD licensed Python library implementing the TOPKAPI
+Hydrological model (Liu and Todini, 2002). The model is a
+physically-based and fully distributed hydrological model, which has
+already been successfully applied in several countries around the
+world (Liu and Todini, 2002; Bartholomes and Todini, 2005; Liu et al.,
+2005; Martina et al., 2006; Vischel et al., 2008, Sinclair and Pegram,
+2010).
+
