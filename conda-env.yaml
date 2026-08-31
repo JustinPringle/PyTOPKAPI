@@ -12,6 +12,8 @@ dependencies:
   - pandas>=2.1         # adapter CSV, calibration alignment, cwqm read_river
   - matplotlib-base>=3.8
   - pyyaml>=6.0         # project.yaml config
+  - networkx>=3.2       # REQUIRED — pretreatment.py & create_file.py import it;
+                        #   pyproject deps are empty so nothing else pulls it
 
   # ---- HDF5 forcing files ----
   - h5py>=3.10          # mode= now mandatory — drives the housekeeping fix (4.6)

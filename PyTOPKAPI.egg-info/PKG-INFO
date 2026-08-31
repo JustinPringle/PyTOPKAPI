@@ -4,4 +4,5 @@ Version: 0.1.0
 Summary: PyTOPKAPI solver, catchment toolkit, and estuary model
 Requires-Python: >=3.11
 License-File: LICENSE
+Requires-Dist: networkx>=3.2
 Dynamic: license-file
