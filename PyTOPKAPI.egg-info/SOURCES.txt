@@ -21,6 +21,7 @@ pytopkapi/utils.py
 pytopkapi.egg-info/PKG-INFO
 pytopkapi.egg-info/SOURCES.txt
 pytopkapi.egg-info/dependency_links.txt
+pytopkapi.egg-info/requires.txt
 pytopkapi.egg-info/top_level.txt
 pytopkapi/parameter_utils/GIS_treatment.py
 pytopkapi/parameter_utils/__init__.py
@@ -35,6 +36,12 @@ pytopkapi/results_analysis/sim_result_tools.py
 pytopkapi/tests/test_infiltration.py
 pytopkapi/tests/test_parameter_utils.py
 pytopkapi/tests/test_continuity/continuity_tests.py
+pytopkapi/tests/test_continuity/routing_tests.py
 scripts/process-catchment
 scripts/run-grass-script
 topkapi_setup/__init__.py
+topkapi_setup/_compat.py
+topkapi_setup/terrain.py
+topkapi_setup/tests/__init__.py
+topkapi_setup/tests/_synthetic.py
+topkapi_setup/tests/test_terrain.py

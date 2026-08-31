@@ -9,7 +9,9 @@ name = "pytopkapi"          # the name pip lists it under (kept the same as upst
 version = "0.1.0"           # any version string; bump it as the work grows
 description = "PyTOPKAPI solver, catchment toolkit, and estuary model"
 requires-python = ">=3.11"  # refuse to install on older Python
-dependencies = []           # DELIBERATELY EMPTY — see note 1 below
+dependencies = [ 
+    "networkx>=3.2", # imported at module top of pretreatment.py & create_file.py
+]           
 
 # ─── Which folders of code belong to it ─────────────────────────
 [tool.setuptools.packages.find]
