@@ -75,6 +75,7 @@ class TerrainResult:
     flowdir: str
     network: str
     slope: str
+    accumulation: str
     flowdir_source: str
     outlet_xy: tuple[float, float]     # snapped pour point (map coords)
     n_cells: int
@@ -305,6 +306,12 @@ def build_terrain(
                                 nodata=NONCHANNEL_VALUE, dtype="uint8"),
         "slope": write_raster(out / "slope.tif", slope, transform, crs,
                               nodata=None, dtype="float32"),
+        # Accumulation is not consumed by create_file; it is written for QC and
+        # for the viewer, since it is the direct way to judge A_thres by eye.
+        "accumulation": write_raster(
+            out / "accumulation.tif",
+            np.where(mask == MASK_IN, np.asarray(acc), 0).astype("float32"),
+            transform, crs, nodata=0, dtype="float32"),
     }
 
     n_cells = int((mask == MASK_IN).sum())
@@ -312,7 +319,8 @@ def build_terrain(
 
     result = TerrainResult(
         mask=paths["mask"], flowdir=paths["flowdir"], network=paths["network"],
-        slope=paths["slope"], flowdir_source=FLOWDIR_SOURCE, outlet_xy=snapped,
+        slope=paths["slope"], accumulation=paths["accumulation"],
+        flowdir_source=FLOWDIR_SOURCE, outlet_xy=snapped,
         n_cells=n_cells, n_channel_cells=n_channel, crs=crs_str,
     )
 

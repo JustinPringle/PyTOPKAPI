@@ -44,6 +44,7 @@ docs/build/
 # restricted and must NOT be committed. Keep raw data out of the repo;
 # commit only configs and manifests. Adjust these paths to taste.
 projects/*/data/
+projects/*/terrain/
 projects/*/results/
 # NOTE: example_simulation/results/ is deliberately NOT ignored — it is
 # the committed regression fixture for the Liebenbergsvlei example.
