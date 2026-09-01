@@ -7,8 +7,10 @@ project). Turns raw GIS + met data into a runnable simulation.
 
 | Stage | Module | State |
 |---|---|---|
-| 4.1 Terrain + network | `terrain.py` | **done (M1)** — mask, flowdir, network, slope |
-| 4.2 Parameter rasters | `params.py` | to do (M2) |
+| M0 env + housekeeping | — | **done** — conda env builds on Py3; h5py modes fixed; Liebenbergsvlei runs green |
+| 4.1 Terrain + network | `terrain.py` | **done (M1)** — mask, flowdir, network, slope, accumulation |
+| Terrain quick-look | `viz.py` | **done** — multi-panel figure of the terrain outputs |
+| 4.2 Parameter rasters | `params.py` | **next (M2)** |
 | 4.3 Forcing builder | `forcing.py` | to do (M3) |
 | 4.4 Config + run | `config.py`, `run.py` | to do (M4) |
 | 4.5 Calibration | `calibrate.py` | to do (M5) |
@@ -24,11 +26,29 @@ python -m topkapi_setup.terrain \
     --out projects/umhlanga/terrain
 ```
 
-Produces `mask.tif`, `flowdir.tif`, `network.tif`, `slope.tif` and a
-`terrain_manifest.json`. `build_terrain()` is the library entry point; the CLI
-is a thin wrapper. The final step runs `check_terrain()`, which drives the real
-`create_file.cell_connectivity` to assert a single outlet before anything is
-written to the solver.
+Produces `mask.tif`, `flowdir.tif`, `network.tif`, `slope.tif`,
+`accumulation.tif` and a `terrain_manifest.json`. `build_terrain()` is the
+library entry point; the CLI is a thin wrapper. The final step runs
+`check_terrain()`, which drives the real `create_file.cell_connectivity` to
+assert a single outlet before anything is written to the solver.
+
+`accumulation.tif` is not consumed by `create_file`; it is emitted for QC and
+for the viewer, and is the direct way to judge whether `A_thres` puts the
+channel head in the right place.
+
+## `viz.py` — terrain quick-look
+
+```bash
+python -m topkapi_setup.viz projects/umhlanga/terrain \
+    --dem projects/umhlanga/dem_utm36s.tif \
+    --out projects/umhlanga/terrain/quicklook.png
+```
+
+Renders a single figure with up to five panels: a catchment overview (hillshade
++ boundary + channel network + outlet), elevation (needs `--dem`), slope, D8
+flow direction (categorical, with a compass legend), and the accumulation
+drainage tree. `plot_terrain()` is the library entry point. `--dem` and
+`accumulation.tif` are optional; missing-optional panels are dropped, not faked.
 
 ### Three contracts it must honour (all enforced in code)
 
