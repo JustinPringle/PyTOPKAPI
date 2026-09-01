@@ -9,8 +9,8 @@ project). Turns raw GIS + met data into a runnable simulation.
 |---|---|---|
 | M0 env + housekeeping | — | **done** — conda env builds on Py3; h5py modes fixed; Liebenbergsvlei runs green |
 | 4.1 Terrain + network | `terrain.py` | **done (M1)** — mask, flowdir, network, slope, accumulation |
-| Terrain quick-look | `viz.py` | **done** — multi-panel figure of the terrain outputs |
-| 4.2 Parameter rasters | `params.py` | **next (M2)** |
+| Quick-look viewer | `viz.py` | **done** — terrain + params panels, and per-raster (`--each`) views |
+| 4.2 Parameter rasters | `params.py` | **done (M2)** — 7 soil/land-cover rasters, Rawls + SANLC default tables |
 | 4.3 Forcing builder | `forcing.py` | to do (M3) |
 | 4.4 Config + run | `config.py`, `run.py` | to do (M4) |
 | 4.5 Calibration | `calibrate.py` | to do (M5) |
