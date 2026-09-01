@@ -16,6 +16,69 @@ project). Turns raw GIS + met data into a runnable simulation.
 | 4.5 Calibration | `calibrate.py` | to do (M5) |
 | §3 CWQM adapter | `adapters/cwqm.py` | to do |
 
+## preflight readme
+
+this is all run in the PyTOPKAPI repo
+
+once a large dem has been downloaded inspect with:
+
+```
+python -m topkapi_setup.preflight inspect --dem path/to/raw/dem.tif
+
+```
+then clip
+
+```
+python -m topkapi_setup.preflight clip --dem path/to/raw/dem.tif --box W E S N --out path/to/clip.tif
+```
+NOTE: work in degrees decimals, E is the positive axis and N is the positive axis, i.e. anything "S" has a "-" sign
+
+here: 
+- W- west (longitude)
+- E - east (longitude)
+- S - south (lattitude)
+- N - north (lattitude)
+
+then we must reproject, eg UTM36
+
+```
+python -m topkapi_setup.preflight reproject --dem path/to/clip.tif --epsg 32736 --res 30 --out path/to/dem_utm36s.tif'
+```
+
+then lets check the outlet and snap to the best location
+first reveal which outputs a png
+
+```
+python -m topkapi_setup.preflight reveal --dem path/to/dem_utm36s.tif' --outlet X Y --out path/to/rivers.png'
+```
+note X, Y are in meters of the rel CRS
+often the outlet wont be quite right, so play until you are close and then run the snap tool
+
+```
+python -m topkapi_setup.preflight snap --dem path/to/dem_utm36s.tif' --outlet X Y
+min_acc=5000
+```
+this prints a better outlet X1, Y1
+
+then you can run the terrain tool to create DEMS which you plot with viz
+
+```
+python -m topkapi_setup.terrain \
+    --dem     path/to/dem_utm36s.tif' \
+    --outlet  X1 Y1 \  
+    --a-thres 1000000 \
+    --min-acc-cells 5000 \
+    --out     path/to/project/terrain 
+
+```
+
+then to visualise:
+
+```
+python -m topkapi_setup.viz 'path/to/project/terrain' --dem path/to/dem_utm36s.tif' --dpi 300 --show
+```
+
+
 ## `terrain.py` (M1)
 
 ```bash
