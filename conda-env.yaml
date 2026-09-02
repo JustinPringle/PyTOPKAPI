@@ -32,6 +32,9 @@ dependencies:
   - pyproj>=3.6         # UTM36S / EPSG:32736
   - scikit-image>=0.22  # pysheds dep — pinned here so pip won't re-pull it
 
+  # ---- Land Type memoir PDFs (M2) ----
+  - pdfplumber>=0.11    # parse AGIS Land Type memoir PDFs → soil attribute CSV
+  
   # ---- testing ----
   - pytest>=8.0
   - pytest-cov>=4.1

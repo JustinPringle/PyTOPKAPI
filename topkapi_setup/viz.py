@@ -255,25 +255,187 @@ def plot_terrain(terrain_dir, dem_path=None, out_png=None, dpi=140, show=False):
     return out_png
 
 
+# --- Individual + parameter-raster views (M2) -------------------------------
+
+# Styling per raster stem: (colorbar label, colormap, log-scale?).
+RASTER_STYLE = {
+    "soil_depth":             ("soil depth (m)",  "viridis",  False),
+    "conductivity":           ("Ks (mm/s)",       "YlGnBu",   True),
+    "resid_moisture_content": ("theta_r (-)",     "BrBG",     False),
+    "sat_moisture_content":   ("theta_s (-)",     "BrBG",     False),
+    "overland_manning":       ("n_o (-)",         "YlOrBr",   False),
+    "bubbling_pressure":      ("psi_b (mm)",      "PuBuGn",   False),
+    "pore_size_dist":         ("lambda (-)",      "cividis",  False),
+    "slope":                  ("slope (deg)",     "magma",    False),
+    "accumulation":           ("cells upstream",  "cubehelix_r", True),
+    "mask":                   ("mask",            "gray",     False),
+    "network":                ("channel",         "Blues",    False),
+    "flowdir":                ("D8 code",         "twilight", False),
+}
+
+# The seven param rasters, in create_file order, for the params panel.
+_PARAM_PANEL = ["soil_depth", "conductivity", "resid_moisture_content",
+                "sat_moisture_content", "overland_manning",
+                "bubbling_pressure", "pore_size_dist"]
+
+
+def _finite_masked(path):
+    """Return ``(array, extent)`` with nodata/NaN masked, ready for imshow."""
+    import numpy.ma as ma
+    arr, transform, _, nodata = read_raster(path)
+    arr = np.asarray(arr, dtype="float64")
+    bad = ~np.isfinite(arr)
+    if nodata is not None:
+        bad |= (arr == nodata)
+    return ma.masked_array(arr, mask=bad), _extent(transform, arr.shape)
+
+
+def _draw(ax, path, *, log=False, label=None, cmap=None):
+    """Draw one raster on ``ax`` with a colorbar; used by both views."""
+    from matplotlib.colors import LogNorm
+    stem = Path(path).stem
+    lbl, default_cmap, default_log = RASTER_STYLE.get(stem, (stem, "viridis", False))
+    data, extent = _finite_masked(path)
+    norm = None
+    if log if log is not None else default_log:
+        pos = data[data > 0]
+        if pos.count():
+            norm = LogNorm(vmin=float(pos.min()), vmax=float(pos.max()))
+    im = ax.imshow(data, cmap=cmap or default_cmap, norm=norm,
+                   extent=extent, origin="upper")
+    ax.figure.colorbar(im, ax=ax, shrink=0.8, label=label or lbl)
+    ax.set_title(stem, fontsize=10)
+    ax.tick_params(labelsize=7)
+    ax.ticklabel_format(style="plain")
+
+
+def plot_raster(path, out_png=None, dpi=140, show=False, log=None,
+                cmap=None, label=None):
+    """Render a single raster to its own figure. Returns the PNG path."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6.4, 5.6))
+    _draw(ax, str(path), log=log, cmap=cmap, label=label)
+    fig.tight_layout()
+    out_png = str(out_png or Path(path).with_suffix(".png"))
+    fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_png
+
+
+def plot_params(params_dir, out_png=None, dpi=140, show=False):
+    """Render the seven parameter rasters as one panel. Returns the PNG path."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    params_dir = Path(params_dir)
+    present = [(k, params_dir / f"{k}.tif") for k in _PARAM_PANEL
+               if (params_dir / f"{k}.tif").exists()]
+    if not present:
+        raise FileNotFoundError(f"no parameter rasters found in {params_dir}")
+
+    ncols = 3
+    nrows = int(np.ceil(len(present) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.0 * ncols, 5.2 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, (_, path) in zip(axes, present):
+        _draw(ax, str(path))
+    for ax in axes[len(present):]:
+        ax.axis("off")
+
+    manifest = params_dir / "params_manifest.json"
+    subtitle = ""
+    if manifest.exists():
+        m = json.loads(manifest.read_text())
+        subtitle = (f"  |  {m.get('n_cells','?')} cells  |  "
+                    f"soil={m.get('soil_source','?')}  depth={m.get('depth_source','?')}")
+    fig.suptitle(f"Parameter rasters{subtitle}", fontsize=12, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    out_png = str(out_png or (params_dir / "params_quicklook.png"))
+    fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    return out_png
+
+
+def plot_each(directory, out_dir=None, dpi=140):
+    """Write one PNG per raster in a terrain or params directory (individual).
+
+    Renders every ``*.tif`` present, each to its own file, so the layers can be
+    inspected one at a time. Returns the list of PNG paths.
+    """
+    directory = Path(directory)
+    out_dir = Path(out_dir or directory)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for tif in sorted(directory.glob("*.tif")):
+        written.append(plot_raster(tif, out_png=out_dir / f"{tif.stem}.png", dpi=dpi))
+    if not written:
+        raise FileNotFoundError(f"no .tif rasters found in {directory}")
+    return written
+
+
+
 # --- Thin CLI ---------------------------------------------------------------
 
 def _build_arg_parser():
     import argparse
     p = argparse.ArgumentParser(
-        description="Render a quick-look figure of a terrain output directory.")
-    p.add_argument("terrain_dir", help="Directory build_terrain wrote")
+        description="Quick-look figures for a terrain or params output "
+                    "directory. Combined panel by default; --each writes one "
+                    "PNG per raster.")
+    p.add_argument("directory", help="a terrain/ or params/ output directory")
+    p.add_argument("--kind", choices=["auto", "terrain", "params"], default="auto",
+                   help="which panel to draw (auto-detected from the manifest)")
+    p.add_argument("--each", action="store_true",
+                   help="write one PNG per raster (individual) instead of a panel")
     p.add_argument("--dem", default=None,
-                   help="Original DEM GeoTIFF (adds hillshade + elevation panel)")
-    p.add_argument("--out", default=None, help="Output PNG (default: <dir>/quicklook.png)")
+                   help="original DEM (terrain panel: adds hillshade + elevation)")
+    p.add_argument("--out", default=None,
+                   help="output PNG (panel) or directory (--each)")
     p.add_argument("--dpi", type=int, default=140)
-    p.add_argument("--show", action="store_true", help="Also open an interactive window")
+    p.add_argument("--show", action="store_true", help="also open a window")
     return p
+
+
+def _detect_kind(directory):
+    d = Path(directory)
+    if (d / "params_manifest.json").exists():
+        return "params"
+    if (d / "terrain_manifest.json").exists():
+        return "terrain"
+    if (d / "mask.tif").exists():
+        return "terrain"
+    if (d / "soil_depth.tif").exists():
+        return "params"
+    raise FileNotFoundError(
+        f"cannot tell if {directory} is terrain or params; pass --kind")
 
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
-    path = plot_terrain(args.terrain_dir, dem_path=args.dem, out_png=args.out,
-                        dpi=args.dpi, show=args.show)
+    kind = args.kind if args.kind != "auto" else _detect_kind(args.directory)
+
+    if args.each:
+        paths = plot_each(args.directory, out_dir=args.out, dpi=args.dpi)
+        print(f"wrote {len(paths)} raster PNGs:")
+        for pth in paths:
+            print(f"  {pth}")
+        return
+
+    if kind == "params":
+        path = plot_params(args.directory, out_png=args.out,
+                           dpi=args.dpi, show=args.show)
+    else:
+        path = plot_terrain(args.directory, dem_path=args.dem, out_png=args.out,
+                            dpi=args.dpi, show=args.show)
     print(f"wrote {path}")
 
 
