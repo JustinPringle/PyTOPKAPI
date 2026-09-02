@@ -114,11 +114,20 @@ means it is too small; a stubby main stem means it is too large.
 
 Produces the **seven** remaining rasters `generate_param_file` reads, each
 snapped to the terrain mask: soil depth `L`, `Ks`, `theta_r`, `theta_s`,
-`psi_b`, `lambda` (all from a soils source) and overland Manning `n_o` (from land
+`psi_b`, `lambda` (from a soils source) and overland Manning `n_o` (from land
 cover). Values are range-validated before writing; a `params_manifest.json`
 records paths and provenance for M4's config generator.
 
-**First pass, before site data exist** — fill the catchment uniformly:
+The soils source is the **SA Land Type** survey, following the SA TOPKAPI lineage
+(Vischel et al. 2008; Sinclair & Pegram 2010): soil depth `L` and texture come
+from each land type's memoir, and texture drives `theta_r/Ks/psi_b/lambda`
+through the Rawls/Maidment table. `params` rasterises the Land Type **shapefile
+directly** — no pre-rasterising — and reads a per-land-type attribute CSV keyed
+by the (alphanumeric) code (e.g. `Fa491`). Two helpers in `soil_table` build that
+CSV from the memoirs, so the code list and the soil numbers come from the data,
+not a hand-typed spreadsheet.
+
+### First pass, before any data — uniform fill
 
 ```bash
 python -m topkapi_setup.params build \
@@ -127,8 +136,75 @@ python -m topkapi_setup.params build \
     --out  projects/umhlanga/params
 ```
 
-**With real layers** — pass an integer soil-form/texture raster and a SANLC 2020
-land-cover raster:
+### 3.1 List the land types in the catchment  —  `soil_table list`
+
+Clip the national Land Type layer to the mask and write a fetch manifest of the
+codes present with their memoir URLs.
+
+```bash
+python -m topkapi_setup.soil_table list \
+    --shp  projects/umhlanga/data/soil/landtype.shp \
+    --mask projects/umhlanga/terrain/mask.tif \
+    --out  projects/umhlanga/data/soil/lt_list.csv
+```
+
+`lt_list.csv` gives `land_type, area_km2, n_polys, objectid, url, pdf_name`,
+sorted by area. The `url` column is the direct memoir link
+(`http://www.agis.agric.za/memoir/pdfs/<code>.pdf`) carried in the shapefile's
+`website` field. Deriving the code list from the clipped geometry — rather than
+reading it off a map — is what keeps a mistyped `Fa41` for `Fa491`, or `Aa91`
+for `Aa9`, out of the pipeline. Download each `<code>.pdf` into one folder,
+named exactly `<code>.pdf`.
+
+### 3.2 Parse the memoirs into the attribute CSV  —  `soil_table build`
+
+```bash
+python -m topkapi_setup.soil_table build \
+    --pdf-dir   projects/umhlanga/data/soil/pdfs \
+    --from-list projects/umhlanga/data/soil/lt_list.csv \
+    --out       projects/umhlanga/data/soil/land_type_attrs.csv
+```
+
+Per land type the parser area-weights every constituent soil series by its
+*Total %*:
+
+| column | meaning |
+|---|---|
+| `L_m` | mean soil depth, range midpoints, **capped at 1.2 m** (root-restricting layer) |
+| `clay_pct` | mean **A-horizon (topsoil)** clay % |
+| `sand_pct` | `100 − clay − 20` (the silt assumption `params` uses internally) |
+| `texture` | area-weighted **dominant memoir texture** (surveyed field texture) — drives `params` |
+| `texture_triangle` | clay+sand → USDA triangle, as a cross-check (audit only) |
+| `soil_coverage_pct` / `non_soil_pct` | share that is soil vs Rock / stream beds (excluded from weighting) |
+
+`theta_s` is left blank, so `params` falls back to the texture porosity; drop in
+Schulze per-land-type porosity here when you have it. To drive texture purely
+from the clay+sand triangle instead of the surveyed class, delete the `texture`
+column — `params` then uses `clay_pct` with the same `sand = 100 − clay − 20`.
+
+### 3.3 Build the seven rasters  —  `params build`
+
+```bash
+python -m topkapi_setup.params build \
+    --mask projects/umhlanga/terrain/mask.tif \
+    --out  projects/umhlanga/soil \
+    --land-type projects/umhlanga/data/soil/landtype.shp --land-type-field landtype \
+    --land-type-table projects/umhlanga/data/soil/land_type_attrs.csv \
+    --landcover projects/umhlanga/data/landuse/SA_NLC_2020_GEO.tif
+```
+
+**Checks worth a glance.** A high `non_soil_pct` (Fa491 is 18.6 % stream beds)
+means the land type is largely channel/alluvium — sane at a valley bottom, a flag
+upslope. A non-empty `notes` field means the surveyed texture and the triangle
+disagreed; open that memoir. Any code in `lt_list.csv` without a matching
+`<code>.pdf` is skipped and reported by `build`, and would otherwise be
+loam-defaulted by `params` with a warning.
+
+### 3.4 Fallback — an already-rasterised soil source
+
+If a soils layer arrives *already* rasterised, skip the Land Type path and pass
+an integer soil-form / texture-class raster; codes map to texture via
+`DEFAULT_SOILFORM_TEXTURE`.
 
 ```bash
 python -m topkapi_setup.params build \
@@ -138,44 +214,32 @@ python -m topkapi_setup.params build \
     --out  projects/umhlanga/params
 ```
 
-### Soil depth from HWSD (FAO)
-
-Soil depth `L` is *not* a Brooks-Corey output; the default per-texture value is
-the weakest number in the table. Replace it with rootable soil depth from HWSD
-v2.0. HWSD ships an SMU-code raster linked to a Microsoft Access (`.mdb`)
-attribute table — the depth lives in the table, not the raster — at 1 km
-(30 arc-second) resolution. Two steps:
+`L` from a soil-form raster is only the weak per-texture default, so override it
+with a continuous depth raster in **metres** — SoilGrids depth-to-bedrock (250 m,
+continuous, no join) works directly:
 
 ```bash
-# 1. Export an "SMU,depth" lookup once from the HWSD .mdb (HWSD viewer or
-#    mdbtools), then reclass the SMU raster to a depth raster (cm -> m):
-python -m topkapi_setup.params hwsd-depth \
-    --smu   hwsd2_smu.tif --table smu_depth.csv --units cm \
-    --out   projects/umhlanga/soil_depth_hwsd.tif
-
-# 2. Feed it to build; it resamples onto the model grid and overrides the default:
 python -m topkapi_setup.params build \
     --mask projects/umhlanga/terrain/mask.tif \
-    --uniform-texture loam --uniform-landcover grassland \
-    --soil-depth projects/umhlanga/soil_depth_hwsd.tif \
+    --soil-form projects/umhlanga/soilform.tif \
+    --soil-depth projects/umhlanga/soilgrids_depth_m.tif \
+    --landcover projects/umhlanga/sanlc2020.tif \
     --out  projects/umhlanga/params
 ```
 
-`--soil-depth` takes any continuous depth GeoTIFF **in metres**, so SoilGrids
-depth-to-bedrock (250 m, continuous, no join) works the same way. At 1 km, HWSD
-gives only ~80 cells across the Ohlanga — fine for a slowly-varying field, but
-SoilGrids is finer if you want it. The `build` run prints which source the depth
-came from and records it in `params_manifest.json`.
+The Land Type memoir path (3.1–3.3) already carries a real per-land-type depth,
+so `--soil-depth` is only needed on this fallback. The `build` run prints which
+source the depth came from and records it in `params_manifest.json`.
 
 ### View the parameter rasters
 
 ```bash
 # all seven in one panel:
-python -m topkapi_setup.viz projects/umhlanga/params \
-    --out projects/umhlanga/params/quicklook.png
+python -m topkapi_setup.viz projects/umhlanga/soil \
+    --out projects/umhlanga/soil/quicklook.png
 
 # each raster on its own, into a folder:
-python -m topkapi_setup.viz projects/umhlanga/params --each --out figs/params
+python -m topkapi_setup.viz projects/umhlanga/soil --each --out figs/params
 ```
 
 ### The default tables
@@ -183,18 +247,19 @@ python -m topkapi_setup.viz projects/umhlanga/params --each --out figs/params
 Two documented defaults live at the top of `params.py` and are meant to be read
 and edited:
 
-* **`RAWLS_BROOKS_COREY`** — Brooks-Corey hydraulics by USDA texture class (Rawls,
-  Brakensiek & Saxton 1982; Rawls & Brakensiek 1985). Stored in literature units
-  (`psi_b` in **metres**); written to raster as **millimetres**, because the
-  solver's Green-Ampt path works in mm-depth (the shipped reference
-  `cell_param.dat` carries `psi_b` ≈ 332 mm, which is how the unit was pinned).
+* **`RAWLS_BROOKS_COREY`** — Brooks-Corey hydraulics by USDA texture class (Rawls
+  & Brakensiek 1985; Maidment 1993). `psi_b` is stored and written in
+  **millimetres** and `Ks` in **mm/s**, matching the solver's Green-Ampt path
+  (mm-depth) — the shipped reference `cell_param.dat` carries `psi_b` ≈ 332 mm,
+  which is how the unit was pinned. `theta_s` is total porosity.
 * **`SANLC_N_O`** — overland Manning `n_o` by SANLC 2020 class group.
 
-Two crosswalks are the **local** piece to tune per catchment:
-`DEFAULT_SOILFORM_TEXTURE` (SA Land Type soil-form → texture class) and
-`DEFAULT_SANLC_CROSSWALK` (SANLC raster code → class group). Codes not in a
-crosswalk fall back to `loam` / `grassland` with a warning — check the run's
-warning list against the codes actually present in your tile.
+`DEFAULT_SANLC_CROSSWALK` (SANLC raster code → class group) is the **local** piece
+to tune per catchment for `n_o`. `DEFAULT_SOILFORM_TEXTURE` (soil-form → texture
+class) only bites on the `--soil-form` fallback of 3.4 — the Land Type path reads
+texture straight from the memoir CSV. Codes not in a crosswalk fall back to
+`loam` / `grassland` with a warning — check the run's warning list against the
+codes actually present in your tile.
 
 `--uniform-texture` accepts any key of `RAWLS_BROOKS_COREY`; `--uniform-landcover`
 any key of `SANLC_N_O`. Full flag list: `python -m topkapi_setup.params build --help`.
@@ -212,7 +277,8 @@ authoritative docs:
 4. A `*_manifest.json` recording output paths, CRS, cell count and provenance,
    for the next stage to consume.
 5. Tests against the synthetic valley fixture (`tests/_synthetic.py`) — no data
-   licence, deterministic.
+   licence, deterministic. (The memoir parser additionally carries two real
+   `<code>.pdf` fixtures, since its whole job is reading that format.)
 
 A module is not "done" until (1)–(5) hold and the suite is green.
 
@@ -224,7 +290,7 @@ A module is not "done" until (1)–(5) hold and the suite is green.
 |---|---|---|---|
 | M0 | env + housekeeping | `conda env create` | done |
 | M1 | preflight / terrain / viz | `preflight`, `terrain`, `viz` | done |
-| M2 | parameter rasters | `params` | done |
+| M2 | parameter rasters | `params`, `soil_table` | done |
 | M3 | forcing builder | `forcing` | to do |
 | M4 | config + run (`--check`) | `config`, `run` | to do |
 | M5 | calibration | `calibrate` | to do |

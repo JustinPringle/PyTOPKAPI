@@ -5,4 +5,5 @@ Summary: PyTOPKAPI solver, catchment toolkit, and estuary model
 Requires-Python: >=3.11
 License-File: LICENSE
 Requires-Dist: networkx>=3.2
+Requires-Dist: pdfplumber>=0.11
 Dynamic: license-file

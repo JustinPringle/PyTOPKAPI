@@ -41,7 +41,16 @@ scripts/process-catchment
 scripts/run-grass-script
 topkapi_setup/__init__.py
 topkapi_setup/_compat.py
+topkapi_setup/landtype_pdf.py
+topkapi_setup/params.py
+topkapi_setup/preflight.py
+topkapi_setup/rasterize_landtype.py
+topkapi_setup/soil_table.py
 topkapi_setup/terrain.py
+topkapi_setup/viz.py
 topkapi_setup/tests/__init__.py
 topkapi_setup/tests/_synthetic.py
+topkapi_setup/tests/test_params.py
+topkapi_setup/tests/test_preflight.py
 topkapi_setup/tests/test_terrain.py
+topkapi_setup/tests/test_viz.py
