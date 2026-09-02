@@ -6,43 +6,56 @@
 ``flowdir``. This module produces the remaining **seven**, every one snapped to
 the terrain ``mask`` grid:
 
-===========================  ======================  ==================  ============
-create_file ``.ini`` key      cell_param column       physical quantity   this module
-===========================  ======================  ==================  ============
-``soil_depth_fname``          8  (``L``)               soil depth (m)      soil table
-``conductivity_fname``        9  (``Ks``)              sat. K (mm/s)       soil table
-``resid_moisture_..._fname``  10 (``theta_r``)         residual moisture   soil table
-``sat_moisture_..._fname``    11 (``theta_s``)         sat. moisture       soil table
-``overland_manning_fname``    12 (``n_o``)             overland Manning    land cover
-``bubbling_pressure_fname``   19 (``psi_b``)           bubbling head (mm)  soil table
-``pore_size_dist_fname``      20 (``lambda``)          pore-size index     soil table
-===========================  ======================  ==================  ============
+===========================  ======================  ==================
+create_file ``.ini`` key      cell_param column       physical quantity
+===========================  ======================  ==================
+``soil_depth_fname``          8  (``L``)               soil depth (m)
+``conductivity_fname``        9  (``Ks``)              sat. K (mm/s)
+``resid_moisture_..._fname``  10 (``theta_r``)         residual moisture
+``sat_moisture_..._fname``    11 (``theta_s``)         sat. moisture
+``overland_manning_fname``    12 (``n_o``)             overland Manning
+``bubbling_pressure_fname``   19 (``psi_b``)           bubbling head (mm)
+``pore_size_dist_fname``      20 (``lambda``)          pore-size index
+===========================  ======================  ==================
 
-Design mirrors ``terrain.py``: pure functions with a thin CLI, every output
-snapped to ``mask.tif`` (bilinear for continuous inputs, nearest for classes),
-range-validated before write, with a ``params_manifest.json`` that ``config.py``
-(M4) will consume.
+Soil methodology follows the SA TOPKAPI lineage (Vischel et al. 2008; Sinclair &
+Pegram 2010), which sources each parameter from a *specific* dataset rather than
+one texture-does-everything lookup:
 
-Two default lookup tables let a catchment run *before* site-specific data exist
-(section 4.2 of the project instructions):
+* **Soil depth ``L`` and ``theta_s``** come from the **Land Type** (soil *type*)
+  -- in practice the lumped per-Land-Type values of the Schulze SA Atlas of
+  Agrohydrology & Climatology (WRC 1489/1/06; via Pike & Schulze's AUTOSOILS).
+* **``theta_r``, ``Ks``, ``psi_b``, ``lambda``** come from the **texture class**
+  through the Rawls & Brakensiek / Maidment (1993) Green-Ampt table
+  (:data:`RAWLS_BROOKS_COREY`) -- the same table Maidment (1993) supplied to the
+  original SA work.
+* **``n_o``** comes from land cover (SANLC) via a Chow-type roughness lookup.
 
-* :data:`RAWLS_BROOKS_COREY` -- Brooks-Corey hydraulics by USDA texture class
-  (Rawls, Brakensiek & Saxton 1982; Rawls & Brakensiek 1985). Values are stored
-  in literature units (``psi_b`` in **metres**); :func:`brooks_corey_from_texture`
-  converts ``psi_b`` to **millimetres** on write, because the solver's Green-Ampt
-  path (``model.py``: ``psi = psi_b / eff_sat**(1/lambda)``) works in mm-depth.
-  The shipped reference ``cell_param.dat`` carries ``psi_b`` ~332 (mm), which is
-  how this unit was pinned down.
-* :data:`SANLC_N_O` -- overland Manning ``n_o`` by SANLC 2020 class group.
+The primary input is therefore a **Land Type raster + a per-land-type attribute
+CSV** (``land_type, L_m, theta_s, texture`` -- or ``clay_pct``/``sand_pct`` when
+only fractions are available). Texture can also be derived from sand/clay
+fractions via the deterministic USDA triangle (:func:`usda_texture_from_fractions`),
+so HWSD/SoilGrids fraction sources plug into the same path. HWSD depth reclass
+(:func:`depth_from_smu`) and a ``--soil-depth`` raster remain as overrides.
 
-The soil source is pluggable, exactly as the DEM was for terrain: pass a
-soil-form (or texture-class) raster and a crosswalk, **or** a single
-``--uniform-texture`` for a first pass. Likewise land cover.
+Units pinned to the solver: ``psi_b`` in **mm** (the Green-Ampt path in
+``model.py`` works in mm-depth; the reference ``cell_param`` carries ~332 mm);
+``Ks`` in **mm/s**; ``theta_s`` is total porosity; ``Ks`` is written as the full
+saturated value (calibration ``fac_Ks`` absorbs the Green-Ampt half-K convention
+rather than baking it into the table).
+
+*Future refinement (noted, not implemented):* Van Tol & Van Zijl's HYDROSOIL /
+DSMART digital-soil-mapping gives finer, hydropedological (flowpath) detail than
+the lumped Land Type. There is no ready national product and it needs DSMART +
+field work; it is a candidate standalone research project. The Land-Type CSV
+contract here is source-agnostic, so a DSMART-derived table would drop in
+unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv as _csv
 import json
 import warnings
 from dataclasses import dataclass, asdict, field
@@ -56,80 +69,74 @@ from rasterio.warp import reproject
 from .terrain import MASK_IN, read_raster, write_raster
 
 # ---------------------------------------------------------------------------
-# Default lookup tables (approved: Rawls texture classes + SANLC groups)
+# Rawls & Brakensiek Brooks-Corey table by USDA texture class (approved).
+# psi_b in mm, Ks in mm/s, theta_s = total porosity. Source: Rawls &
+# Brakensiek (1985) / Maidment (1993), Table 9 (converted from cm, cm/hr).
+# Pure "silt" is absent from the Rawls table (rare); the crosswalk maps it to
+# silt_loam.
 # ---------------------------------------------------------------------------
-
-#: Brooks-Corey hydraulic parameters by USDA texture class.
-#: ``psi_b`` in **metres** (converted to mm on write); ``Ks`` in **mm/s**.
-#: Sources: Rawls, Brakensiek & Saxton (1982); Rawls & Brakensiek (1985).
 RAWLS_BROOKS_COREY: dict[str, dict[str, float]] = {
-    "sand":       {"theta_r": 0.020, "theta_s": 0.417, "psi_b_m": 0.073,
-                   "lambda_pore": 0.592, "Ks_mm_s": 5.83e-2},
-    "sandy_loam": {"theta_r": 0.041, "theta_s": 0.453, "psi_b_m": 0.147,
-                   "lambda_pore": 0.322, "Ks_mm_s": 1.20e-2},
-    "loam":       {"theta_r": 0.027, "theta_s": 0.463, "psi_b_m": 0.112,
-                   "lambda_pore": 0.220, "Ks_mm_s": 3.67e-3},
-    "clay_loam":  {"theta_r": 0.075, "theta_s": 0.464, "psi_b_m": 0.259,
-                   "lambda_pore": 0.194, "Ks_mm_s": 6.39e-4},
-    "clay":       {"theta_r": 0.090, "theta_s": 0.475, "psi_b_m": 0.373,
-                   "lambda_pore": 0.165, "Ks_mm_s": 1.67e-4},
+    "sand":            {"theta_r": 0.020, "theta_s": 0.437, "psi_b_mm": 72.6,  "lambda_pore": 0.694, "Ks_mm_s": 6.54e-2},
+    "loamy_sand":      {"theta_r": 0.035, "theta_s": 0.437, "psi_b_mm": 86.9,  "lambda_pore": 0.553, "Ks_mm_s": 1.66e-2},
+    "sandy_loam":      {"theta_r": 0.041, "theta_s": 0.453, "psi_b_mm": 146.6, "lambda_pore": 0.378, "Ks_mm_s": 6.06e-3},
+    "loam":            {"theta_r": 0.027, "theta_s": 0.463, "psi_b_mm": 111.5, "lambda_pore": 0.252, "Ks_mm_s": 3.67e-3},
+    "silt_loam":       {"theta_r": 0.015, "theta_s": 0.501, "psi_b_mm": 207.9, "lambda_pore": 0.234, "Ks_mm_s": 1.89e-3},
+    "sandy_clay_loam": {"theta_r": 0.068, "theta_s": 0.398, "psi_b_mm": 280.8, "lambda_pore": 0.319, "Ks_mm_s": 8.33e-4},
+    "clay_loam":       {"theta_r": 0.075, "theta_s": 0.464, "psi_b_mm": 258.9, "lambda_pore": 0.242, "Ks_mm_s": 5.56e-4},
+    "silty_clay_loam": {"theta_r": 0.040, "theta_s": 0.471, "psi_b_mm": 325.6, "lambda_pore": 0.177, "Ks_mm_s": 5.56e-4},
+    "sandy_clay":      {"theta_r": 0.109, "theta_s": 0.430, "psi_b_mm": 291.7, "lambda_pore": 0.223, "Ks_mm_s": 3.33e-4},
+    "silty_clay":      {"theta_r": 0.056, "theta_s": 0.479, "psi_b_mm": 341.9, "lambda_pore": 0.150, "Ks_mm_s": 2.78e-4},
+    "clay":            {"theta_r": 0.090, "theta_s": 0.475, "psi_b_mm": 373.0, "lambda_pore": 0.165, "Ks_mm_s": 1.67e-4},
 }
 
-#: Default soil depth ``L`` (m) by texture class. Soil depth is *not* a
-#: Brooks-Corey output; these are pragmatic defaults and are the weakest part of
-#: the soil table -- override with a measured depth raster or ``--soil-depth``
-#: once SA Land Type / SoilGrids depth-to-restriction data are on hand.
-DEFAULT_SOIL_DEPTH_M: dict[str, float] = {
-    "sand": 0.8, "sandy_loam": 1.0, "loam": 1.2,
-    "clay_loam": 1.0, "clay": 0.8,
+#: USDA texture class integer coding (USDA-ARS convention). 6 = silt -> silt_loam.
+USDA_CODE_TEXTURE: dict[int, str] = {
+    1: "sand", 2: "loamy_sand", 3: "sandy_loam", 4: "loam", 5: "silt_loam",
+    6: "silt_loam", 7: "sandy_clay_loam", 8: "clay_loam", 9: "silty_clay_loam",
+    10: "sandy_clay", 11: "silty_clay", 12: "clay",
+}
+DEFAULT_SOILFORM_TEXTURE = dict(USDA_CODE_TEXTURE)   # alias for the soil-form path
+
+#: Common SA / shorthand texture labels -> canonical Rawls key.
+TEXTURE_ALIASES: dict[str, str] = {
+    "sa": "sand", "s": "sand",
+    "losa": "loamy_sand", "ls": "loamy_sand", "loamysand": "loamy_sand",
+    "salm": "sandy_loam", "salo": "sandy_loam", "sl": "sandy_loam", "sandyloam": "sandy_loam",
+    "lm": "loam", "lo": "loam",
+    "silm": "silt_loam", "sil": "silt_loam", "siltloam": "silt_loam",
+    "si": "silt_loam",
+    "saclm": "sandy_clay_loam", "saclo": "sandy_clay_loam", "sacllm": "sandy_clay_loam",
+    "scl": "sandy_clay_loam",
+    "cllm": "clay_loam", "cllo": "clay_loam", "clayloam": "clay_loam",
+    "siclm": "silty_clay_loam", "sicl": "silty_clay_loam",
+    "sacl": "sandy_clay", "sc": "sandy_clay",
+    "sicl2": "silty_clay", "sic": "silty_clay",
+    "c": "clay",
 }
 
-#: Overland Manning ``n_o`` by SANLC 2020 class *group* (Chow-type roughness).
+#: Fallback per-texture soil depth (m) when no Land Type / measured depth given.
+DEFAULT_SOIL_DEPTH_M: dict[str, float] = {t: 1.0 for t in RAWLS_BROOKS_COREY}
+
+#: Overland Manning n_o by SANLC 2020 class group (Chow-type roughness).
 SANLC_N_O: dict[str, float] = {
-    "water_wetland":  0.030,
-    "bare_eroded":    0.050,
-    "cultivated":     0.100,
-    "grassland":      0.150,
-    "bush_thicket":   0.250,
-    "forest":         0.400,
-    "built_up":       0.015,
+    "water_wetland": 0.030, "bare_eroded": 0.050, "cultivated": 0.100,
+    "grassland": 0.150, "bush_thicket": 0.250, "forest": 0.400, "built_up": 0.015,
 }
 
-#: Default SANLC 2020 raster-code -> group crosswalk. SANLC 2020 has ~73 classes;
-#: this maps the standard top-level groupings and is meant to be *edited* to the
-#: exact codes of the tile in hand. Unmapped codes fall back to ``grassland``
-#: with a warning. (Codes below follow the common SANLC 2020 legend ordering;
-#: confirm against the specific product/version delivered.)
+#: Default SANLC 2020 raster-code -> group crosswalk (edit for your product version).
 DEFAULT_SANLC_CROSSWALK: dict[int, str] = {
-    1: "forest", 2: "forest", 3: "forest",            # indigenous / plantation forest
-    4: "bush_thicket", 5: "bush_thicket",             # woodland / thicket
-    6: "grassland",                                   # grassland
-    7: "water_wetland", 8: "water_wetland",           # water bodies / wetlands
-    9: "bare_eroded", 10: "bare_eroded",              # bare / eroded ground
-    11: "cultivated", 12: "cultivated",               # commercial / subsistence crops
-    13: "built_up", 14: "built_up", 15: "built_up",   # urban / built / hardened
+    1: "forest", 2: "forest", 3: "forest", 4: "bush_thicket", 5: "bush_thicket",
+    6: "grassland", 7: "water_wetland", 8: "water_wetland", 9: "bare_eroded",
+    10: "bare_eroded", 11: "cultivated", 12: "cultivated", 13: "built_up",
+    14: "built_up", 15: "built_up",
 }
 
-#: Default SA Land Type soil-form -> USDA texture crosswalk. The texture side is
-#: citable literature; *this* mapping is the local piece and should be tuned to
-#: the catchment's dominant soil forms. Keyed on an integer soil-form code in
-#: the soil raster; unmapped codes fall back to ``loam`` with a warning.
-DEFAULT_SOILFORM_TEXTURE: dict[int, str] = {
-    1: "sand", 2: "sandy_loam", 3: "loam", 4: "clay_loam", 5: "clay",
-}
-
-# Physically plausible ranges, used by :func:`validate_ranges`.
 PARAM_RANGES: dict[str, tuple[float, float]] = {
-    "soil_depth":  (0.1, 5.0),      # m
-    "Ks":          (1e-6, 1.0),     # mm/s
-    "theta_r":     (0.0, 0.20),
-    "theta_s":     (0.30, 0.55),
-    "psi_b":       (10.0, 2000.0),  # mm
-    "lambda_pore": (0.05, 1.0),
-    "n_o":         (0.01, 0.6),
+    "soil_depth": (0.1, 5.0), "Ks": (1e-6, 1.0), "theta_r": (0.0, 0.20),
+    "theta_s": (0.30, 0.55), "psi_b": (10.0, 2000.0), "lambda_pore": (0.05, 1.0),
+    "n_o": (0.01, 0.6),
 }
 
-# The seven raster keys this module emits, in create_file order.
 RASTER_KEYS = ("soil_depth", "conductivity", "resid_moisture_content",
                "sat_moisture_content", "overland_manning",
                "bubbling_pressure", "pore_size_dist")
@@ -138,12 +145,11 @@ NODATA = np.float32(-9999.0)
 
 
 # ---------------------------------------------------------------------------
-# Grid definition (everything snaps to the terrain mask)
+# Grid (everything snaps to the terrain mask)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class GridSpec:
-    """The model grid, taken from ``mask.tif`` so params align with terrain."""
     shape: tuple[int, int]
     transform: object
     crs: object
@@ -151,34 +157,99 @@ class GridSpec:
 
 
 def grid_from_mask(mask_path: str) -> GridSpec:
-    """Read the terrain mask and return the grid every param raster snaps to."""
     arr, transform, crs, _ = read_raster(mask_path)
     return GridSpec(shape=arr.shape, transform=transform, crs=crs,
                     mask=(arr == MASK_IN))
 
 
-def resample_to_grid(src_path: str, grid: GridSpec, *, continuous: bool) -> np.ndarray:
-    """Reproject/resample a source raster onto ``grid``.
-
-    ``continuous=True`` uses bilinear (elevation-like fields); ``False`` uses
-    nearest, correct for integer class rasters (soil form, land cover).
-    """
+def resample_to_grid(src_path, grid, *, continuous):
+    """Reproject a source raster onto ``grid`` (bilinear continuous / nearest class)."""
     with rasterio.open(src_path) as src:
         src_arr = src.read(1)
-        src_crs = src.crs
-        src_transform = src.transform
-        src_nodata = src.nodata
+        src_crs, src_transform, src_nodata = src.crs, src.transform, src.nodata
     dtype = "float32" if continuous else "int32"
     dst = np.zeros(grid.shape, dtype=dtype)
-    reproject(
-        source=src_arr.astype(dtype),
-        destination=dst,
-        src_transform=src_transform, src_crs=src_crs,
-        dst_transform=grid.transform, dst_crs=grid.crs,
-        src_nodata=src_nodata,
-        resampling=Resampling.bilinear if continuous else Resampling.nearest,
-    )
+    reproject(source=src_arr.astype(dtype), destination=dst,
+              src_transform=src_transform, src_crs=src_crs,
+              dst_transform=grid.transform, dst_crs=grid.crs, src_nodata=src_nodata,
+              resampling=Resampling.bilinear if continuous else Resampling.nearest)
     return dst
+
+
+# ---------------------------------------------------------------------------
+# Texture resolution
+# ---------------------------------------------------------------------------
+
+def _norm(label) -> str:
+    return "".join(str(label).lower().split()).replace("-", "").replace("_", "")
+
+
+def _resolve_one(token):
+    """Resolve a single texture token to a Rawls key, or None if unrecognised."""
+    key = _norm(token)
+    if key in RAWLS_BROOKS_COREY:
+        return key
+    canon = {_norm(k): k for k in RAWLS_BROOKS_COREY}
+    if key in canon:
+        return canon[key]
+    return TEXTURE_ALIASES.get(key)
+
+
+def resolve_texture(label, *, default="loam"):
+    """Map a texture label to a Rawls key.
+
+    Handles canonical names, SA shorthands (:data:`TEXTURE_ALIASES`), USDA
+    integer codes, and compound range labels like ``"SaCl-Cl"`` or
+    ``"SaClLm-Sa"`` (WR90/Schulze), for which the first resolvable component is
+    used. Returns ``default`` (``"loam"``) if nothing resolves; pass
+    ``default=None`` to detect that.
+    """
+    if isinstance(label, (int, np.integer)) or (isinstance(label, float) and float(label).is_integer()):
+        return USDA_CODE_TEXTURE.get(int(label), default)
+    hit = _resolve_one(label)
+    if hit:
+        return hit
+    import re
+    for part in re.split(r"[-/,]| to ", str(label)):
+        hit = _resolve_one(part)
+        if hit:
+            return hit
+    return default
+
+
+def usda_texture_from_fractions(sand_pct: float, clay_pct: float) -> str:
+    """USDA texture class from sand% and clay% (standard soil-texture triangle)."""
+    s, c = float(sand_pct), float(clay_pct)
+    si = 100.0 - s - c
+    if si + 1.5 * c < 15:
+        return "sand"
+    if si + 1.5 * c >= 15 and si + 2 * c < 30:
+        return "loamy_sand"
+    if (7 <= c < 20 and s > 52 and si + 2 * c >= 30) or (c < 7 and si < 50 and si + 2 * c >= 30):
+        return "sandy_loam"
+    if 7 <= c < 27 and 28 <= si < 50 and s <= 52:
+        return "loam"
+    if (si >= 50 and 12 <= c < 27) or (50 <= si < 80 and c < 12):
+        return "silt_loam"
+    if si >= 80 and c < 12:
+        return "silt_loam"          # pure silt folds to silt_loam (no Rawls silt row)
+    if 20 <= c < 35 and si < 28 and s > 45:
+        return "sandy_clay_loam"
+    if 27 <= c < 40 and 20 < s <= 45:
+        return "clay_loam"
+    if 27 <= c < 40 and s <= 20:
+        return "silty_clay_loam"
+    if c >= 35 and s > 45:
+        return "sandy_clay"
+    if c >= 40 and si >= 40:
+        return "silty_clay"
+    if c >= 40 and s <= 45 and si < 40:
+        return "clay"
+    return "loam"
+
+
+def _texture_props(texture: str) -> dict:
+    return RAWLS_BROOKS_COREY[resolve_texture(texture)]
 
 
 # ---------------------------------------------------------------------------
@@ -186,110 +257,184 @@ def resample_to_grid(src_path: str, grid: GridSpec, *, continuous: bool) -> np.n
 # ---------------------------------------------------------------------------
 
 def _map_classes(class_arr, lookup, default, what):
-    """Map an integer class raster to floats via ``lookup``; warn on fallback."""
     out = np.full(class_arr.shape, np.nan, dtype="float32")
-    seen_unmapped = set()
+    unmapped = set()
     for code in np.unique(class_arr):
         code = int(code)
         val = lookup.get(code)
         if val is None:
-            seen_unmapped.add(code)
+            unmapped.add(code)
             val = default
         out[class_arr == code] = val
-    if seen_unmapped:
-        warnings.warn(
-            f"{what}: codes {sorted(seen_unmapped)} not in crosswalk; "
-            f"fell back to default ({default}). Edit the crosswalk for this tile.",
-            stacklevel=2,
-        )
+    if unmapped:
+        warnings.warn(f"{what}: codes {sorted(unmapped)} not in lookup; used "
+                      f"default ({default}).", stacklevel=2)
     return out
 
 
-def brooks_corey_from_texture(texture_code_arr, table=RAWLS_BROOKS_COREY,
-                              crosswalk=DEFAULT_SOILFORM_TEXTURE,
-                              depth_table=DEFAULT_SOIL_DEPTH_M):
-    """Return the six soil rasters from an integer soil-form/texture raster.
+# ---- Land Type path (Schulze / SA lineage: primary) ------------------------
 
-    Returns a dict with ``soil_depth`` (m), ``conductivity`` (mm/s),
-    ``resid_moisture_content``, ``sat_moisture_content``,
-    ``bubbling_pressure`` (**mm**), ``pore_size_dist``.
+def read_land_type_csv(path):
+    """Read a per-land-type attribute CSV into ``{code: resolved-props}``.
+
+    Recognised columns (case-insensitive): the land-type code
+    (``land_type``/``code``/``lt``), ``L_m`` (soil depth, m), ``theta_s``
+    (optional), and either ``texture`` (name/shorthand/USDA code) or
+    ``clay_pct`` (+ optional ``sand_pct``). texture -> theta_r/Ks/psi_b/lambda
+    via the Rawls table; theta_s falls back to the texture porosity if absent.
     """
-    # code -> texture name (via crosswalk); codes already naming a texture pass through
-    texture_of = {}
-    for code in np.unique(texture_code_arr):
-        code = int(code)
-        texture_of[code] = crosswalk.get(code, "loam")
+    with open(path, newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    if not rows:
+        raise ValueError(f"empty land-type table: {path}")
+    cols = {c.lower(): c for c in rows[0].keys()}
 
-    def field(param_key, scale=1.0):
-        lut = {c: table[t][param_key] * scale for c, t in texture_of.items()}
-        return _map_classes(texture_code_arr, lut, table["loam"][param_key] * scale,
-                            f"soil form ({param_key})")
+    def col(*names):
+        for n in names:
+            if n in cols:
+                return cols[n]
+        return None
 
-    depth_lut = {c: depth_table[t] for c, t in texture_of.items()}
+    c_code = col("land_type", "code", "lt", "land_type_code")
+    c_L = col("l_m", "l", "depth_m", "depth")
+    c_ts = col("theta_s", "thetas", "porosity")
+    c_tex = col("texture", "texture_class", "tex")
+    c_clay = col("clay_pct", "clay", "clay_percent")
+    c_sand = col("sand_pct", "sand", "sand_percent")
+    if c_code is None or c_L is None:
+        raise ValueError("land-type table needs at least a code column and L_m")
+
+    table = {}
+    for r in rows:
+        code = str(r[c_code]).strip()          # keep alphanumeric codes (e.g. "Fa491")
+        if c_tex and r.get(c_tex):
+            texture = resolve_texture(r[c_tex], default=None)
+            if texture is None:
+                warnings.warn(f"land type {code}: texture '{r[c_tex]}' not recognised; "
+                              f"using loam. Use a canonical USDA name (e.g. 'sandy_clay') "
+                              f"or clay_pct.", stacklevel=2)
+                texture = "loam"
+        elif c_clay and r.get(c_clay):
+            sand = float(r[c_sand]) if (c_sand and r.get(c_sand)) else 100.0 - float(r[c_clay]) - 20.0
+            texture = usda_texture_from_fractions(max(sand, 0.0), float(r[c_clay]))
+        else:
+            texture = "loam"
+        p = _texture_props(texture)
+        theta_s = float(r[c_ts]) if (c_ts and r.get(c_ts)) else p["theta_s"]
+        table[code] = {
+            "soil_depth": float(r[c_L]),
+            "sat_moisture_content": theta_s,
+            "resid_moisture_content": p["theta_r"],
+            "conductivity": p["Ks_mm_s"],
+            "bubbling_pressure": p["psi_b_mm"],
+            "pore_size_dist": p["lambda_pore"],
+            "texture": texture,
+        }
+    return table
+
+
+def properties_from_land_type(code_arr, table, code_to_key=None):
+    """Reclass a land-type raster into the six soil rasters via ``table``.
+
+    ``table`` is keyed by the land-type code string (e.g. ``"Fa491"`` or
+    ``"1101"``). ``code_to_key`` maps each integer raster value to that string
+    key; when ``None`` the pixel integer is used directly (``str(int)``), which
+    covers a plain integer-coded raster.
+    """
+    default = _texture_props("loam")
+    default_row = {"soil_depth": DEFAULT_SOIL_DEPTH_M["loam"],
+                   "sat_moisture_content": default["theta_s"],
+                   "resid_moisture_content": default["theta_r"],
+                   "conductivity": default["Ks_mm_s"],
+                   "bubbling_pressure": default["psi_b_mm"],
+                   "pore_size_dist": default["lambda_pore"]}
+    fields = ("soil_depth", "conductivity", "resid_moisture_content",
+              "sat_moisture_content", "bubbling_pressure", "pore_size_dist")
+    out = {f: np.full(code_arr.shape, np.nan, dtype="float32") for f in fields}
+    unmapped = set()
+    for v in np.unique(code_arr):
+        v = int(v)
+        key = code_to_key.get(v) if code_to_key else str(v)
+        row = table.get(key)
+        sel = code_arr == v
+        for f in fields:
+            out[f][sel] = row[f] if row is not None else default_row[f]
+        if row is None:
+            unmapped.add(key if key is not None else v)
+    if unmapped:
+        warnings.warn(f"land type: codes {sorted(map(str, unmapped))} not in the "
+                      f"attribute table; used loam defaults.", stacklevel=2)
+    return out
+
+
+def rasterize_land_type(vector_path, field, grid):
+    """Burn a Land Type vector's (string) ``field`` onto ``grid`` as integer ids.
+
+    Returns ``(int32_array, code_to_key)`` where ``code_to_key`` maps each burned
+    id back to the original field value string. Lets you feed the AGIS Land Type
+    layer straight in (``landtype`` = ``"Fa491"`` etc.) without hand-assigning
+    integers. Requires geopandas.
+    """
+    import geopandas as gpd
+    from rasterio.features import rasterize as _rasterize
+
+    gdf = gpd.read_file(vector_path)
+    if grid.crs is not None:
+        gdf = gdf.to_crs(grid.crs)
+    values = sorted(str(v).strip() for v in gdf[field].dropna().unique())
+    key_to_id = {v: i + 1 for i, v in enumerate(values)}          # 0 reserved for nodata
+    shapes = [(geom, key_to_id[str(val).strip()])
+              for geom, val in zip(gdf.geometry, gdf[field])
+              if geom is not None and str(val).strip() in key_to_id]
+    arr = _rasterize(shapes, out_shape=grid.shape, transform=grid.transform,
+                     fill=0, dtype="int32")
+    return arr, {i: v for v, i in key_to_id.items()}
+
+
+# ---- Texture-class path (soil-form raster / uniform: fallback) -------------
+
+def brooks_corey_from_texture(texture_code_arr, crosswalk=DEFAULT_SOILFORM_TEXTURE):
+    """Six soil rasters from an integer texture/soil-form raster (fallback path)."""
+    texture_of = {int(c): crosswalk.get(int(c), "loam") for c in np.unique(texture_code_arr)}
+
+    def field_lut(fn):
+        return {c: fn(_texture_props(t)) for c, t in texture_of.items()}
+
+    depth_lut = {c: DEFAULT_SOIL_DEPTH_M.get(t, 1.0) for c, t in texture_of.items()}
+    default = _texture_props("loam")
     return {
-        "soil_depth": _map_classes(texture_code_arr, depth_lut,
-                                   depth_table["loam"], "soil form (depth)"),
-        "conductivity":            field("Ks_mm_s"),
-        "resid_moisture_content":  field("theta_r"),
-        "sat_moisture_content":    field("theta_s"),
-        "bubbling_pressure":       field("psi_b_m", scale=1000.0),   # m -> mm
-        "pore_size_dist":          field("lambda_pore"),
+        "soil_depth": _map_classes(texture_code_arr, depth_lut, 1.0, "soil form (depth)"),
+        "conductivity": _map_classes(texture_code_arr, field_lut(lambda p: p["Ks_mm_s"]), default["Ks_mm_s"], "soil form (Ks)"),
+        "resid_moisture_content": _map_classes(texture_code_arr, field_lut(lambda p: p["theta_r"]), default["theta_r"], "soil form (theta_r)"),
+        "sat_moisture_content": _map_classes(texture_code_arr, field_lut(lambda p: p["theta_s"]), default["theta_s"], "soil form (theta_s)"),
+        "bubbling_pressure": _map_classes(texture_code_arr, field_lut(lambda p: p["psi_b_mm"]), default["psi_b_mm"], "soil form (psi_b)"),
+        "pore_size_dist": _map_classes(texture_code_arr, field_lut(lambda p: p["lambda_pore"]), default["lambda_pore"], "soil form (lambda)"),
     }
 
 
-def manning_from_landcover(lc_code_arr, groups=SANLC_N_O,
-                           crosswalk=DEFAULT_SANLC_CROSSWALK):
-    """Return the overland Manning ``n_o`` raster from a SANLC class raster."""
-    lut = {code: groups[group] for code, group in crosswalk.items()}
+def manning_from_landcover(lc_code_arr, groups=SANLC_N_O, crosswalk=DEFAULT_SANLC_CROSSWALK):
+    lut = {code: groups[grp] for code, grp in crosswalk.items()}
     return _map_classes(lc_code_arr, lut, groups["grassland"], "SANLC")
 
 
-# ---------------------------------------------------------------------------
-# HWSD soil-depth helper
-# ---------------------------------------------------------------------------
+# ---- HWSD soil-depth helper (optional override source) ---------------------
 
 def _read_smu_depth_csv(csv_path, units="cm"):
-    """Read an SMU -> depth lookup CSV into ``{code: depth_m}``.
-
-    Two columns, header row: the first is the SMU code, the second the depth.
-    ``units`` converts the depth column to metres (``cm`` -> /100, ``m`` -> as-is).
-    """
-    import csv as _csv
     scale = 0.01 if units == "cm" else 1.0
     out = {}
     with open(csv_path, newline="") as fh:
         reader = _csv.reader(fh)
-        next(reader, None)                       # skip header
+        next(reader, None)
         for row in reader:
-            if len(row) < 2 or not row[0].strip():
-                continue
-            out[int(float(row[0]))] = float(row[1]) * scale
+            if len(row) >= 2 and row[0].strip():
+                out[int(float(row[0]))] = float(row[1]) * scale
     return out
 
 
-def depth_from_smu(smu_raster_path, smu_to_depth_m, out_path,
-                   default_depth_m=None):
-    """Reclass an HWSD SMU-code raster into a soil-depth raster (metres).
-
-    HWSD v2.0 is an SMU-code raster linked to an attribute database; the rootable
-    soil depth lives in that table, not the raster. Export an ``SMU, depth``
-    lookup once from the HWSD ``.mdb`` (HWSD viewer or ``mdbtools``), then this
-    turns the SMU raster into a depth raster in a single call. Feed the result to
-    :func:`build_params` via ``soil_depth_path`` / ``--soil-depth``; it is
-    resampled onto the model grid there, so this output keeps HWSD's own CRS.
-
-    Parameters
-    ----------
-    smu_raster_path : path to the HWSD SMU-code GeoTIFF.
-    smu_to_depth_m : ``{smu_code: depth_m}`` dict, or a path to a ``SMU, depth``
-        CSV (assumed centimetres; see :func:`_read_smu_depth_csv`).
-    out_path : where to write the depth GeoTIFF (float32, metres).
-    default_depth_m : depth for SMU codes not in the lookup. ``None`` writes
-        nodata there (and warns), so gaps surface rather than hide.
-    """
+def depth_from_smu(smu_raster_path, smu_to_depth_m, out_path, default_depth_m=None):
+    """Reclass an HWSD SMU-code raster into a soil-depth raster (metres)."""
     if isinstance(smu_to_depth_m, (str, Path)):
         smu_to_depth_m = _read_smu_depth_csv(smu_to_depth_m)
-
     smu, transform, crs, _ = read_raster(str(smu_raster_path))
     smu = np.asarray(smu)
     depth = np.full(smu.shape, NODATA, dtype="float32")
@@ -302,10 +447,8 @@ def depth_from_smu(smu_raster_path, smu_to_depth_m, out_path,
             continue
         depth[smu == code] = val
     if missing:
-        warnings.warn(
-            f"depth_from_smu: {len(missing)} SMU code(s) not in the lookup "
-            f"(e.g. {sorted(missing)[:5]}); left as nodata. Extend the SMU->depth "
-            f"table or pass default_depth_m.", stacklevel=2)
+        warnings.warn(f"depth_from_smu: {len(missing)} SMU code(s) not in lookup "
+                      f"(e.g. {sorted(missing)[:5]}); left as nodata.", stacklevel=2)
     return write_raster(str(out_path), depth, transform, crs,
                         nodata=float(NODATA), dtype="float32")
 
@@ -314,20 +457,11 @@ def depth_from_smu(smu_raster_path, smu_to_depth_m, out_path,
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_ranges(rasters: dict, mask: np.ndarray) -> list[str]:
-    """Check in-mask values against :data:`PARAM_RANGES`. Returns problem strings.
-
-    NaNs inside the mask are always a problem (they become garbage in
-    ``cell_param``); out-of-range values are flagged so implausible defaults are
-    caught before the solver sees them.
-    """
-    # map raster key -> range key
-    range_of = {
-        "soil_depth": "soil_depth", "conductivity": "Ks",
-        "resid_moisture_content": "theta_r", "sat_moisture_content": "theta_s",
-        "overland_manning": "n_o", "bubbling_pressure": "psi_b",
-        "pore_size_dist": "lambda_pore",
-    }
+def validate_ranges(rasters, mask):
+    range_of = {"soil_depth": "soil_depth", "conductivity": "Ks",
+                "resid_moisture_content": "theta_r", "sat_moisture_content": "theta_s",
+                "overland_manning": "n_o", "bubbling_pressure": "psi_b",
+                "pore_size_dist": "lambda_pore"}
     problems = []
     for key, arr in rasters.items():
         inside = arr[mask]
@@ -336,9 +470,7 @@ def validate_ranges(rasters: dict, mask: np.ndarray) -> list[str]:
         lo, hi = PARAM_RANGES[range_of[key]]
         finite = inside[np.isfinite(inside)]
         if finite.size and (finite.min() < lo or finite.max() > hi):
-            problems.append(
-                f"{key}: values [{finite.min():.4g}, {finite.max():.4g}] "
-                f"outside plausible [{lo:g}, {hi:g}]")
+            problems.append(f"{key}: [{finite.min():.4g}, {finite.max():.4g}] outside [{lo:g}, {hi:g}]")
     return problems
 
 
@@ -348,7 +480,6 @@ def validate_ranges(rasters: dict, mask: np.ndarray) -> list[str]:
 
 @dataclass
 class ParamResult:
-    """Paths and provenance emitted by :func:`build_params`."""
     soil_depth: str
     conductivity: str
     resid_moisture_content: str
@@ -360,134 +491,106 @@ class ParamResult:
     n_cells: int
     soil_source: str
     landcover_source: str
-    depth_source: str = "texture-default"
+    depth_source: str = "from soil source"
     warnings: list = field(default_factory=list)
 
-    def to_json(self, path) -> None:
+    def to_json(self, path):
         Path(path).write_text(json.dumps(asdict(self), indent=2))
 
 
-def _uniform_class_raster(grid: GridSpec, code: int) -> np.ndarray:
+def _uniform(grid, code):
     return np.full(grid.shape, code, dtype="int32")
 
 
-def build_params(
-    mask_path: str,
-    out_dir: str,
-    *,
-    soil_form_path: str | None = None,
-    landcover_path: str | None = None,
-    soil_depth_path: str | None = None,
-    uniform_texture: str | None = None,
-    uniform_landcover: str | None = None,
-    validate: bool = True,
-) -> ParamResult:
+def build_params(mask_path, out_dir, *, land_type_path=None, land_type_table=None,
+                 land_type_field=None, soil_form_path=None, uniform_texture=None,
+                 landcover_path=None, uniform_landcover=None, soil_depth_path=None,
+                 validate=True):
     """Build the seven parameter rasters, snapped to ``mask_path``.
 
-    Provide either a raster or a ``uniform_*`` fallback for each of soil and land
-    cover. Uniform fills give a defensible first run before site data exist.
-
-    ``soil_depth_path`` is an optional continuous depth raster **in metres** (e.g.
-    from HWSD via :func:`depth_from_smu`, or SoilGrids). When given it overrides
-    the per-texture default depth and is resampled bilinearly onto the grid.
+    Soil source (one of, priority): ``land_type_path`` + ``land_type_table``
+    (Schulze/SA lineage: L, theta_s, texture->theta_r/Ks/psi_b/lambda);
+    ``soil_form_path`` (texture/soil-form raster); or ``uniform_texture``.
+    ``soil_depth_path`` (metres) overrides L. Land cover -> n_o.
     """
     grid = grid_from_mask(mask_path)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # --- soil source -> texture-code raster ---
-    if soil_form_path:
-        soil_codes = resample_to_grid(soil_form_path, grid, continuous=False)
-        soil_source = f"raster:{soil_form_path}"
-    elif uniform_texture:
-        if uniform_texture not in RAWLS_BROOKS_COREY:
-            raise ValueError(f"uniform_texture must be one of {list(RAWLS_BROOKS_COREY)}")
-        # invert the crosswalk so the texture name maps back to a code
-        code = next((c for c, t in DEFAULT_SOILFORM_TEXTURE.items()
-                     if t == uniform_texture), None)
-        if code is None:      # texture not in default crosswalk: synthesise a code
-            code = max(DEFAULT_SOILFORM_TEXTURE) + 1
-            DEFAULT_SOILFORM_TEXTURE[code] = uniform_texture
-        soil_codes = _uniform_class_raster(grid, code)
-        soil_source = f"uniform:{uniform_texture}"
-    else:
-        raise ValueError("Provide soil_form_path or uniform_texture")
-
-    # --- land-cover source -> SANLC-code raster ---
-    if landcover_path:
-        lc_codes = resample_to_grid(landcover_path, grid, continuous=False)
-        landcover_source = f"raster:{landcover_path}"
-    elif uniform_landcover:
-        if uniform_landcover not in SANLC_N_O:
-            raise ValueError(f"uniform_landcover must be one of {list(SANLC_N_O)}")
-        code = next((c for c, g in DEFAULT_SANLC_CROSSWALK.items()
-                     if g == uniform_landcover), None)
-        if code is None:
-            code = max(DEFAULT_SANLC_CROSSWALK) + 1
-            DEFAULT_SANLC_CROSSWALK[code] = uniform_landcover
-        lc_codes = _uniform_class_raster(grid, code)
-        landcover_source = f"uniform:{uniform_landcover}"
-    else:
-        raise ValueError("Provide landcover_path or uniform_landcover")
-
-    # --- map to properties ---
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        rasters = brooks_corey_from_texture(soil_codes)
-        rasters["overland_manning"] = manning_from_landcover(lc_codes)
+
+        if land_type_path:
+            if not land_type_table:
+                raise ValueError("land_type_path needs land_type_table")
+            if land_type_field:                       # vector + string field -> auto int ids
+                codes, code_to_key = rasterize_land_type(land_type_path, land_type_field, grid)
+            else:                                     # already an integer-coded raster
+                codes, code_to_key = resample_to_grid(land_type_path, grid, continuous=False), None
+            rasters = properties_from_land_type(codes, read_land_type_csv(land_type_table),
+                                                code_to_key)
+            soil_source = f"land_type:{land_type_path}"
+        elif soil_form_path:
+            codes = resample_to_grid(soil_form_path, grid, continuous=False)
+            rasters = brooks_corey_from_texture(codes)
+            soil_source = f"soil_form:{soil_form_path}"
+        elif uniform_texture:
+            t = resolve_texture(uniform_texture)
+            rasters = brooks_corey_from_texture(_uniform(grid, next(c for c, n in USDA_CODE_TEXTURE.items() if n == t)))
+            soil_source = f"uniform:{t}"
+        else:
+            raise ValueError("provide land_type_path, soil_form_path, or uniform_texture")
+
+        if landcover_path:
+            lc = resample_to_grid(landcover_path, grid, continuous=False)
+            rasters["overland_manning"] = manning_from_landcover(lc)
+            landcover_source = f"raster:{landcover_path}"
+        elif uniform_landcover:
+            if uniform_landcover not in SANLC_N_O:
+                raise ValueError(f"uniform_landcover must be one of {list(SANLC_N_O)}")
+            rasters["overland_manning"] = np.full(grid.shape, SANLC_N_O[uniform_landcover], "float32")
+            landcover_source = f"uniform:{uniform_landcover}"
+        else:
+            raise ValueError("provide landcover_path or uniform_landcover")
+
         warn_msgs = [str(w.message) for w in caught]
 
-    # zero out (nodata) outside the mask so downstream reads are unambiguous
     for key in rasters:
         rasters[key] = np.where(grid.mask, rasters[key], np.nan).astype("float32")
 
-    # optional measured soil-depth raster (HWSD/SoilGrids) overrides the default
-    depth_source = f"texture-default ({soil_source})"
+    depth_source = f"soil source ({soil_source})"
     if soil_depth_path:
         depth = resample_to_grid(soil_depth_path, grid, continuous=True)
         rasters["soil_depth"] = np.where(grid.mask, depth, np.nan).astype("float32")
         depth_source = f"raster:{soil_depth_path}"
 
-    # --- validate before writing ---
     if validate:
         problems = validate_ranges(rasters, grid.mask)
         if problems:
-            raise ValueError("Parameter rasters failed validation:\n  - "
-                             + "\n  - ".join(problems))
+            raise ValueError("Parameter rasters failed validation:\n  - " + "\n  - ".join(problems))
 
-    # --- write (nodata outside mask) ---
     paths = {}
     for key in RASTER_KEYS:
         arr = np.where(grid.mask, rasters[key], NODATA).astype("float32")
-        paths[key] = write_raster(str(out / f"{key}.tif"), arr,
-                                  grid.transform, grid.crs,
-                                  nodata=float(NODATA), dtype="float32")
+        paths[key] = write_raster(str(out / f"{key}.tif"), arr, grid.transform,
+                                  grid.crs, nodata=float(NODATA), dtype="float32")
 
-    crs_str = str(grid.crs)
     result = ParamResult(
         soil_depth=paths["soil_depth"], conductivity=paths["conductivity"],
         resid_moisture_content=paths["resid_moisture_content"],
         sat_moisture_content=paths["sat_moisture_content"],
         overland_manning=paths["overland_manning"],
-        bubbling_pressure=paths["bubbling_pressure"],
-        pore_size_dist=paths["pore_size_dist"],
-        crs=crs_str, n_cells=int(grid.mask.sum()),
-        soil_source=soil_source, landcover_source=landcover_source,
-        depth_source=depth_source, warnings=warn_msgs,
-    )
+        bubbling_pressure=paths["bubbling_pressure"], pore_size_dist=paths["pore_size_dist"],
+        crs=str(grid.crs), n_cells=int(grid.mask.sum()), soil_source=soil_source,
+        landcover_source=landcover_source, depth_source=depth_source, warnings=warn_msgs)
     result.to_json(out / "params_manifest.json")
     return result
 
 
-def check_params(result: ParamResult, mask_path: str) -> dict:
-    """Re-read the written rasters and assert they align with the mask.
-
-    A cheap post-write guard: same shape/CRS as the mask, and no NaN/nodata
-    inside the catchment. Mirrors ``terrain.check_terrain``.
-    """
+def check_params(result, mask_path):
     grid = grid_from_mask(mask_path)
     for key in RASTER_KEYS:
-        arr, _, crs, nodata = read_raster(getattr(result, key))
+        arr, _, _, nodata = read_raster(getattr(result, key))
         if arr.shape != grid.shape:
             raise ValueError(f"{key}: shape {arr.shape} != mask {grid.shape}")
         inside = arr[grid.mask]
@@ -504,66 +607,52 @@ def check_params(result: ParamResult, mask_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_arg_parser():
-    p = argparse.ArgumentParser(
-        prog="python -m topkapi_setup.params",
-        description="Generate the 7 soil/land-cover parameter rasters "
-                    "generate_param_file needs, snapped to a terrain mask.")
+    p = argparse.ArgumentParser(prog="python -m topkapi_setup.params",
+                                description="Generate the 7 soil/land-cover parameter "
+                                            "rasters generate_param_file needs.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     b = sub.add_parser("build", help="build the 7 parameter rasters")
-    b.add_argument("--mask", required=True,
-                   help="mask.tif from terrain.py (defines the model grid)")
+    b.add_argument("--mask", required=True, help="mask.tif from terrain.py")
     b.add_argument("--out", required=True, help="output directory")
-    b.add_argument("--soil-form",
-                   help="integer soil-form / texture-class raster")
-    b.add_argument("--uniform-texture", choices=list(RAWLS_BROOKS_COREY),
-                   help="fill the whole catchment with one texture (first-pass)")
+    b.add_argument("--land-type", help="Land Type raster (integer-coded) or, with "
+                                       "--land-type-field, a vector (shp/gpkg/geojson)")
+    b.add_argument("--land-type-field", help="string code field in the Land Type vector "
+                                             "(e.g. 'landtype'); burns it to integer ids")
+    b.add_argument("--land-type-table", help="per-land-type CSV: land_type,L_m,theta_s,texture "
+                                             "(land_type may be alphanumeric, e.g. Fa491)")
+    b.add_argument("--soil-form", help="integer texture/soil-form raster (fallback)")
+    b.add_argument("--uniform-texture", help="fill one USDA texture (first-pass)")
     b.add_argument("--landcover", help="SANLC 2020 class raster")
-    b.add_argument("--uniform-landcover", choices=list(SANLC_N_O),
-                   help="fill the whole catchment with one land-cover group")
-    b.add_argument("--soil-depth",
-                   help="continuous soil-depth raster in METRES (HWSD/SoilGrids); "
-                        "overrides the per-texture default depth")
-    b.add_argument("--no-validate", action="store_true",
-                   help="skip the pre-write range/NaN validation")
+    b.add_argument("--uniform-landcover", choices=list(SANLC_N_O), help="fill one land-cover group")
+    b.add_argument("--soil-depth", help="continuous soil-depth raster (m); overrides L")
+    b.add_argument("--no-validate", action="store_true")
 
-    h = sub.add_parser(
-        "hwsd-depth",
-        help="reclass an HWSD SMU-code raster into a soil-depth raster (metres)")
-    h.add_argument("--smu", required=True, help="HWSD SMU-code GeoTIFF")
-    h.add_argument("--table", required=True,
-                   help="CSV lookup: 'SMU,depth' (header row)")
-    h.add_argument("--units", choices=["cm", "m"], default="cm",
-                   help="units of the depth column (default cm; HWSD is cm)")
-    h.add_argument("--default-depth-m", type=float, default=None,
-                   help="depth (m) for unmapped SMU codes (default: nodata)")
-    h.add_argument("--out", required=True, help="output depth GeoTIFF")
+    h = sub.add_parser("hwsd-depth", help="reclass HWSD SMU raster -> soil-depth raster (m)")
+    h.add_argument("--smu", required=True)
+    h.add_argument("--table", required=True, help="CSV 'SMU,depth' (header)")
+    h.add_argument("--units", choices=["cm", "m"], default="cm")
+    h.add_argument("--default-depth-m", type=float, default=None)
+    h.add_argument("--out", required=True)
     return p
 
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
-
     if args.cmd == "hwsd-depth":
         table = _read_smu_depth_csv(args.table, units=args.units)
-        path = depth_from_smu(args.smu, table, args.out,
-                              default_depth_m=args.default_depth_m)
-        print(f"Wrote soil-depth raster (m) -> {path}")
-        print("Feed it to `params build --soil-depth`.")
+        path = depth_from_smu(args.smu, table, args.out, default_depth_m=args.default_depth_m)
+        print(f"Wrote soil-depth raster (m) -> {path}\nFeed it to `params build --soil-depth`.")
         return
-
-    result = build_params(
-        args.mask, args.out,
-        soil_form_path=args.soil_form, landcover_path=args.landcover,
-        soil_depth_path=args.soil_depth,
-        uniform_texture=args.uniform_texture,
-        uniform_landcover=args.uniform_landcover,
-        validate=not args.no_validate,
-    )
+    result = build_params(args.mask, args.out, land_type_path=args.land_type,
+                          land_type_table=args.land_type_table,
+                          land_type_field=args.land_type_field, soil_form_path=args.soil_form,
+                          uniform_texture=args.uniform_texture, landcover_path=args.landcover,
+                          uniform_landcover=args.uniform_landcover, soil_depth_path=args.soil_depth,
+                          validate=not args.no_validate)
     info = check_params(result, args.mask)
-    print(f"Wrote {info['rasters']} parameter rasters for {info['n_cells']} "
-          f"cells -> {args.out}")
-    print(f"  soil depth from: {result.depth_source}")
+    print(f"Wrote {info['rasters']} parameter rasters for {info['n_cells']} cells -> {args.out}")
+    print(f"  soil source: {result.soil_source}\n  depth from: {result.depth_source}")
     if result.warnings:
         print("Warnings:")
         for w in result.warnings:
