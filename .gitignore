@@ -45,6 +45,7 @@ docs/build/
 # commit only configs and manifests. Adjust these paths to taste.
 projects/*/data/
 projects/*/terrain/
+projects/*/soils/
 projects/*/results/
 # NOTE: example_simulation/results/ is deliberately NOT ignored — it is
 # the committed regression fixture for the Liebenbergsvlei example.
