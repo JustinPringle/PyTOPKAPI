@@ -265,7 +265,16 @@ codes actually present in your tile.
 any key of `SANLC_N_O`. Full flag list: `python -m topkapi_setup.params build --help`.
 
 ---
+## Creating the cell_params.dat file
 
+```
+python -m topkapi_setup.params cell-param \
+    --terrain projects/umhlanga/terrain \
+    --params  projects/umhlanga/soil \
+    --dem     projects/umhlanga/data/dem_utm36s.tif \
+    --out     projects/umhlanga/cell_param.dat
+```
+---
 ## Writing new stages
 
 Keep the contract every module here follows, so this file and `--help` stay the
