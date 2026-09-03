@@ -58,6 +58,7 @@ import argparse
 import csv as _csv
 import json
 import warnings
+from configparser import ConfigParser
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -603,6 +604,180 @@ def check_params(result, mask_path):
 
 
 # ---------------------------------------------------------------------------
+# cell_param.dat  (drive the real create_file.generate_param_file)
+# ---------------------------------------------------------------------------
+#
+# ``generate_param_file`` assembles the 21-column ``cell_param.dat`` from twelve
+# co-registered rasters named in an ``.ini``.  terrain.py (M1) supplies five --
+# ``mask``, ``slope`` (create_file's ``hillslope``), ``network``, ``flowdir``,
+# plus the user's DEM -- and ``build`` above supplies the other seven.  Our job
+# here is small: write that ``.ini``, guard the two silent create_file traps
+# (channel background must be 255; flowdir must be masked), drive the real
+# function, and check the result.  We do *not* write ``global_param.dat`` -- the
+# second ASCII file is catchment-wide and belongs to config.py (M4).
+
+#: Cold-start scalars create_file stores as catchment-wide constants
+#: (cell_param columns 15-18).  Revisit ``pVs_t0`` at calibration.  ``Kc`` is a
+#: single crop factor here because create_file only accepts a scalar; a
+#: per-land-cover Kc is a modify_file post-step, not baked in now.
+DEFAULT_INIT = {"pVs_t0": 30.0, "Vo_t0": 0.0, "Qc_t0": 0.0, "Kc": 1.0}
+
+ARCGIS_D8_CODES = frozenset({1, 2, 4, 8, 16, 32, 64, 128})
+
+#: create_file .ini key -> filename written by terrain.py.  Note ``slope.tif``
+#: feeds ``hillslope_fname`` (create_file reads degrees, then tan(pi/180 * s)).
+_TERRAIN_RASTERS = {"mask_fname": "mask.tif", "hillslope_fname": "slope.tif",
+                    "channel_network_fname": "network.tif",
+                    "flowdir_fname": "flowdir.tif"}
+#: create_file .ini key -> filename written by ``build`` (RASTER_KEYS + .tif).
+_PARAM_RASTERS = {"soil_depth_fname": "soil_depth.tif",
+                  "conductivity_fname": "conductivity.tif",
+                  "resid_moisture_content_fname": "resid_moisture_content.tif",
+                  "sat_moisture_content_fname": "sat_moisture_content.tif",
+                  "overland_manning_fname": "overland_manning.tif",
+                  "bubbling_pressure_fname": "bubbling_pressure.tif",
+                  "pore_size_dist_fname": "pore_size_dist.tif"}
+
+
+def resolve_cell_param_rasters(terrain_dir, params_dir, dem_path):
+    """Return the ``{ini_key: path}`` map for the twelve rasters; error if any missing."""
+    terrain_dir, params_dir = Path(terrain_dir), Path(params_dir)
+    paths = {"dem_fname": str(dem_path)}
+    for key, name in _TERRAIN_RASTERS.items():
+        paths[key] = str(terrain_dir / name)
+    for key, name in _PARAM_RASTERS.items():
+        paths[key] = str(params_dir / name)
+    missing = [f"{k} -> {v}" for k, v in paths.items() if not Path(v).exists()]
+    if missing:
+        raise FileNotFoundError("cell_param.dat inputs missing:\n  - " + "\n  - ".join(missing))
+    return paths
+
+
+def cell_param_ini(raster_paths, out_dat, *, init=None, flowdir_source="ArcGIS"):
+    """Build the create_file ``.ini`` (a ConfigParser) from resolved paths + scalars."""
+    init = {**DEFAULT_INIT, **(init or {})}
+    cfg = ConfigParser()
+    cfg["raster_files"] = {**raster_paths, "flowdir_source": flowdir_source}
+    cfg["output"] = {"param_fname": str(out_dat)}
+    cfg["numerical_values"] = {k: repr(float(init[k]))
+                               for k in ("pVs_t0", "Vo_t0", "Qc_t0", "Kc")}
+    return cfg
+
+
+def _value_problems(mask_bool, network, flowdir, continuous):
+    """Array-only create_file contract checks; returns problem strings (empty == OK).
+
+    ``continuous`` maps a name to an array (dem, slope and the seven params); we
+    only ever look inside the mask so out-of-catchment fill is irrelevant.
+    """
+    inside = mask_bool.astype(bool)
+    problems = []
+    if inside.sum() == 0:
+        problems.append("mask has no in-catchment cells (== 1)")
+        return problems
+    # Contract: channel background must be exactly 255.  create_file runs
+    # ``network[network < 255] = 1``, so a 0 inside the mask becomes a channel.
+    net_in = network[inside]
+    stray = np.unique(net_in[(net_in != 1) & (net_in != 255)])
+    if stray.size:
+        problems.append(
+            f"channel_network has values {stray.tolist()} inside mask -- only "
+            "1=channel / 255=background allowed (a 0 makes every cell a channel)")
+    # Contract: flowdir masked to the catchment (0 outside), valid D8 inside, so
+    # the single cell draining out of the mask is the outlet.
+    if np.any(flowdir[~inside] != 0):
+        problems.append("flowdir is non-zero outside the mask (must be 0 so the "
+                        "only cell draining out is the outlet)")
+    fdir_in = flowdir[inside]
+    bad = np.unique(fdir_in[~np.isin(fdir_in, list(ARCGIS_D8_CODES))])
+    if bad.size:
+        problems.append(f"flowdir has non-ArcGIS D8 codes {bad.tolist()} inside mask")
+    for name, arr in continuous.items():
+        vals = arr[inside]
+        holes = np.isnan(vals) | (vals == float(NODATA))
+        if holes.any():
+            problems.append(f"{name}: {int(holes.sum())} NaN/nodata cell(s) inside mask")
+    return problems
+
+
+def _same_grid(a, b, atol=1e-6):
+    (shape_a, tf_a, crs_a), (shape_b, tf_b, crs_b) = a, b
+    return (shape_a == shape_b and crs_a == crs_b
+            and np.allclose(tuple(tf_a)[:6], tuple(tf_b)[:6], atol=atol))
+
+
+def cell_param_preflight(raster_paths):
+    """Read the twelve rasters; check co-registration + create_file contracts.
+
+    Raises ``ValueError`` listing every problem so a bad grid fails here with a
+    clear message rather than deep inside ``generate_param_file``.  Returns the
+    in-catchment cell count on success.
+    """
+    arrays, meta = {}, {}
+    for key, path in raster_paths.items():
+        arr, transform, crs, _ = read_raster(path)
+        arrays[key] = arr
+        meta[key] = (arr.shape, transform, crs)
+
+    ref = meta["mask_fname"]
+    problems = [f"{key}: grid {meta[key][0]} / {tuple(meta[key][1])[:6]} / {meta[key][2]} "
+                f"!= mask {ref[0]} / {tuple(ref[1])[:6]} / {ref[2]}"
+                for key in raster_paths if not _same_grid(meta[key], ref)]
+
+    mask_bool = arrays["mask_fname"] == MASK_IN
+    continuous = {k: arrays[k] for k in ("dem_fname", "hillslope_fname", *_PARAM_RASTERS)}
+    problems += _value_problems(mask_bool, arrays["channel_network_fname"],
+                                arrays["flowdir_fname"], continuous)
+    if problems:
+        raise ValueError("cell_param preflight failed:\n  - " + "\n  - ".join(problems))
+    return int(mask_bool.sum())
+
+
+def check_cell_param(param_fname, *, n_cells=None):
+    """Post-check the written ``cell_param.dat``: shape, single outlet, finite."""
+    table = np.loadtxt(param_fname)
+    if table.ndim != 2 or table.shape[1] != 21:
+        raise ValueError(f"cell_param.dat has shape {table.shape}; expected (n_cells, 21)")
+    if n_cells is not None and table.shape[0] != n_cells:
+        raise ValueError(f"cell_param.dat has {table.shape[0]} rows; mask has {n_cells} cells")
+    n_outlets = int((table[:, 14] == -999).sum())
+    if n_outlets != 1:
+        raise ValueError(f"cell_param.dat has {n_outlets} outlets "
+                         "(cell_down == -999); expected exactly 1")
+    if not np.isfinite(table).all():
+        raise ValueError("cell_param.dat contains non-finite values")
+    return {"param_fname": str(param_fname), "n_cells": int(table.shape[0]),
+            "n_channel_cells": int(table[:, 3].sum()), "n_outlets": n_outlets}
+
+
+def write_cell_param(terrain_dir, params_dir, dem_path, out_dat, *,
+                     init=None, flowdir_source="ArcGIS", preflight=True):
+    """Assemble ``cell_param.dat`` by driving ``create_file.generate_param_file``.
+
+    Resolves the twelve rasters (five from ``terrain_dir`` + the DEM, seven from
+    ``params_dir``), preflights the grid, writes the ``.ini`` next to ``out_dat``,
+    calls the real function, and post-checks the output.  Returns a summary dict.
+    """
+    from pytopkapi.parameter_utils.create_file import generate_param_file  # lazy: needs GDAL
+
+    out_dat = Path(out_dat)
+    out_dat.parent.mkdir(parents=True, exist_ok=True)
+    paths = resolve_cell_param_rasters(terrain_dir, params_dir, dem_path)
+
+    n_cells = cell_param_preflight(paths) if preflight else None
+
+    cfg = cell_param_ini(paths, out_dat, init=init, flowdir_source=flowdir_source)
+    ini_path = out_dat.with_suffix(".ini")
+    with open(ini_path, "w") as fh:
+        cfg.write(fh)
+
+    generate_param_file(str(ini_path))
+    summary = check_cell_param(out_dat, n_cells=n_cells)
+    summary["ini_fname"] = str(ini_path)
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -628,6 +803,22 @@ def _build_arg_parser():
     b.add_argument("--soil-depth", help="continuous soil-depth raster (m); overrides L")
     b.add_argument("--no-validate", action="store_true")
 
+    c = sub.add_parser("cell-param",
+                       help="assemble cell_param.dat via create_file.generate_param_file")
+    c.add_argument("--terrain", required=True,
+                   help="terrain.py output dir (mask/slope/network/flowdir)")
+    c.add_argument("--params", required=True, help="`params build` output dir (the 7 rasters)")
+    c.add_argument("--dem", required=True,
+                   help="DEM used for terrain (UTM36S, m); must share the mask grid")
+    c.add_argument("--out", required=True, help="output cell_param.dat path")
+    c.add_argument("--pVs-t0", type=float, default=DEFAULT_INIT["pVs_t0"],
+                   help="initial %% soil saturation (default %(default)s)")
+    c.add_argument("--Vo-t0", type=float, default=DEFAULT_INIT["Vo_t0"])
+    c.add_argument("--Qc-t0", type=float, default=DEFAULT_INIT["Qc_t0"])
+    c.add_argument("--kc", type=float, default=DEFAULT_INIT["Kc"],
+                   help="crop factor, constant for all cells (default %(default)s)")
+    c.add_argument("--no-preflight", action="store_true")
+
     h = sub.add_parser("hwsd-depth", help="reclass HWSD SMU raster -> soil-depth raster (m)")
     h.add_argument("--smu", required=True)
     h.add_argument("--table", required=True, help="CSV 'SMU,depth' (header)")
@@ -639,6 +830,16 @@ def _build_arg_parser():
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
+    if args.cmd == "cell-param":
+        init = {"pVs_t0": args.pVs_t0, "Vo_t0": args.Vo_t0,
+                "Qc_t0": args.Qc_t0, "Kc": args.kc}
+        s = write_cell_param(args.terrain, args.params, args.dem, args.out,
+                             init=init, preflight=not args.no_preflight)
+        print(f"Wrote cell_param.dat: {s['n_cells']} cells, "
+              f"{s['n_channel_cells']} channel cells, {s['n_outlets']} outlet "
+              f"-> {s['param_fname']}")
+        print(f"  .ini: {s['ini_fname']}")
+        return
     if args.cmd == "hwsd-depth":
         table = _read_smu_depth_csv(args.table, units=args.units)
         path = depth_from_smu(args.smu, table, args.out, default_depth_m=args.default_depth_m)
