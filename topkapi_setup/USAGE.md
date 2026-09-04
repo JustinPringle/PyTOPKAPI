@@ -8,9 +8,11 @@ map of *which* command to reach for and *why*.
 ```
 raw DEM ──preflight──▶ clean UTM36S DEM ──terrain──▶ mask/flowdir/network/slope
                                                           │
-                                              params ◀────┘ (snaps to the mask)
+                                              params ◀────┤ (snaps to the mask)
                                                           │
-                                            (M3) forcing, (M4) config + run …
+                                             forcing ◀────┘ (same cell order)
+                                                          │
+                                              (M4) config + run …
 ```
 
 Convention throughout: **projected CRS in metres (UTM Zone 36S, EPSG:32736)**,
@@ -275,6 +277,463 @@ python -m topkapi_setup.params cell-param \
     --out     projects/umhlanga/cell_param.dat
 ```
 ---
+
+## 4. Build the rainfall forcing  —  `forcing`  (M3)
+
+Produces `rainfields.h5`: one array of shape `(n_timesteps, n_cells)` holding
+rainfall depth in mm for every cell at every step, in the **same cell order**
+`cell_param.dat` uses. That file plus `ET.h5` and `global_param.dat` is what the
+solver runs on.
+
+```
+manifest.csv ─┐
+              ├─▶ W (n_cells × n_gauges)  ─┐
+   mask.tif ──┘      build once             ├─▶ field ─▶ rainfields.h5
+                                            │            + forcing_manifest.json
+measurements.csv ─▶ readings (n_t × n_gauges)┘
+                    + availability
+```
+
+**One command builds the file.** Given the two input files (4.2, or sourced via
+4.1) and the terrain mask, `forcing` runs the whole stage — align to the clock,
+build `W`, interpolate, and write `rainfields.h5` with the cell-order guard
+armed — and drops a `forcing_manifest.json` beside it.
+
+```bash
+python -m topkapi_setup.forcing \
+    --manifest     projects/umhlanga/forcing/gauge_manifest.csv \
+    --measurements projects/umhlanga/forcing/measurements.csv \
+    --mask         projects/umhlanga/terrain/mask.tif \
+    --cell-param   projects/umhlanga/cell_param.dat \
+    --start "2025-01-01 01:00" --end "2025-02-01 00:00" --dt 3600 \
+    --method idw --group ohlanga_jan2025 \
+    --out projects/umhlanga/forcing/rainfields.h5
+```
+```bash
+python -m topkapi_setup.forcing \
+    --manifest projects/umhlanga/forcing/gauge_manifest.csv \
+    --measurements projects/umhlanga/forcing/measurements.csv \
+    --mask projects/umhlanga/terrain/mask.tif --cell-param projects/umhlanga/cell_param.dat \
+    --start "2025-01-01 01:00" --end "2025-02-01 00:00" --dt 3600 \
+    --group ohlanga_jan2025 --trim \
+    --out projects/umhlanga/forcing/rainfields.h5
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--cell-param` | none | arms the cell-order guard — **pass it** (see 4.6) |
+| `--start`/`--end` | — | first/last interval-ending stamp on the clock |
+| `--dt` | `3600` | model timestep, seconds; must match `global_param` `Dt` |
+| `--tz` | naive | e.g. `Africa/Johannesburg`; set it consistently |
+| `--group` | `sample_event` | HDF5 group; must match `group_name` in the sim `.ini` |
+| `--method` | `idw` | `mean`/`thiessen`/`idw`/`kriging` (see 4.4) |
+| `--buffer-km` | all | per-run: keep only gauges within this range of the catchment |
+| `--min-coverage` | `0.8` | bin completeness when aggregating (4.5) |
+| `--block-size` | `720` | timesteps per write block (4.7) |
+| `--trim` | off | clip the window to the gauge record if it overshoots at either end |
+| `--no-guard` | off | skip the cell-order guard — don't |
+
+The run prints a one-line summary — steps × cells, gauges used, per-gauge
+coverage, and the wettest step — and everything it did lands in
+`forcing_manifest.json` (output paths, CRS, cell/gauge counts, method + params,
+the clock, coverage per gauge, and peak-field stats) for the next stage and for
+`viz` to read. If you need finer control than the flags expose, 4.3 is the same
+sequence as library calls.
+
+The one idea worth holding: rainfall on a cell is a **weighted blend of the
+gauge readings**, and the weights depend only on where the cell sits relative to
+the gauges. That geometry never changes, so the weight table `W` is built once
+and reused for every timestep. Choosing an interpolation method means choosing
+how `W` is filled — nothing downstream changes.
+
+### 4.1 Sourcing gauges from eThekwini FEWS
+
+The two input files in 4.2 can be handed in directly, or built from the
+eThekwini FEWS network with two adapters under `topkapi_setup/forcing/sources/`.
+Both are thin CLIs; run them in order.
+
+```
+gauges_raw.json ──gauge_manifest──▶ manifest.csv ──ethekwini_fews──▶ measurements.csv
+```
+
+**Scope the network to the catchment — `gauge_manifest`.** Reprojects every
+station to the mask's CRS, keeps those within a buffer of the delineated
+catchment, and writes the manifest.
+
+```bash
+python -m topkapi_setup.forcing.sources.gauge_manifest \
+    --network projects/umhlanga/raw/gauges_raw.json \
+    --mask    projects/umhlanga/terrain/mask.tif \
+    --out     projects/umhlanga/forcing/gauge_manifest.csv \
+    --buffer-km 20
+```
+
+`--network` is the FEWS station dump saved verbatim (the API returns a
+Python-literal string, not strict JSON; both parse). `--mask` is the `terrain.py`
+mask and must be projected in metres — the buffer distance and the output
+coordinates are metres in its CRS. The output carries two extra columns beyond
+4.2's contract: `device` (the instrument serial, provenance only) and `in_mask`.
+
+Keep the buffer. A gauge just outside the divide still constrains the field at
+the edge, where the constraint is most useful; `in_mask` records whether a gauge
+is strictly inside the catchment or doing that boundary work. Both belong in the
+manifest, so this is the coarse scoping step — not `select_gauges` (4.4), which
+is a finer per-run choice layered on top.
+
+**Pull the series — `ethekwini_fews`.** Fetches each gauge in the manifest over a
+date window and writes `measurements.csv`.
+
+```bash
+export ETHEKWINI_FEWS_KEY=…            # Authorization header, never the URL
+python -m topkapi_setup.forcing.sources.ethekwini_fews \
+    --manifest  projects/umhlanga/data/manifest.csv \
+    --start 20250101 --end 20250131 \
+    --out       projects/umhlanga/data/measurements.csv \
+    --cache-dir projects/umhlanga/raw/fews
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--cache-dir` | none | raw JSON per gauge-window; provenance, and resumes a run |
+| `--step` | `1h` | emit grid; no coarser than `Dt` |
+| `--gap-threshold` | `12h` | a longer silence is a gap, a shorter one is dry; `none` disables |
+| `--min-interval` | `1.0` | seconds between requests; raise it if `429` persists |
+| `--auth-scheme` | `bearer` | Authorization header scheme |
+
+Three things about this feed, all handled by the adapter:
+
+- **Auth is `Bearer <key>`** from `$ETHEKWINI_FEWS_KEY`. A `401` means the key is
+  absent in the shell you ran from.
+- **It rate-limits.** Requests are paced `--min-interval` apart and a `429`/`503`
+  is retried with backoff, honouring `Retry-After`; with `--cache-dir` set a
+  throttled run resumes rather than restarting.
+- **It reports by exception** — a row per tip during rain, only a sparse
+  heartbeat when dry. The collector fills dry hours the gauge was demonstrably
+  alive through with `0` and reserves a gap for silences past `--gap-threshold`,
+  so a dry hour is never mistaken for missing data. (Left raw, every dry hour
+  would read as a gap and the field would refuse to assemble — see the last
+  gotcha in 4.8.)
+
+Because the collector emits on a regular `--step` grid, these gauges' native step
+*is* that grid (`1h` by default), so they need no `native_step` entry in 4.5.
+
+**Timezone — confirm before calibration.** Stamps come from the feed's `tstr`
+field, the UTC rendering of its epoch. Whether that wall-clock is genuinely UTC
+or a local (SAST) clock labelled as UTC is not knowable from the data. Stamps are
+emitted naive — set the zone once on `Timeline` (`tz="Africa/Johannesburg"` if
+local) and pin it against a storm's known onset. A silent 2 h offset is invisible
+in totals and wrong against tides and DWS flow.
+
+### 4.2 The two input files
+
+Coordinates live apart from the series, mirroring the CWQM river contract. Build
+them with 4.1, or supply them yourself in these formats.
+
+**`manifest.csv`** — one row per gauge:
+
+```
+gauge_id,x,y,crs,name,source,native_step
+0241078,31.05,-29.72,EPSG:4326,uMhlanga,SAWS,5min
+0241512,316000,6712000,EPSG:32736,Ohlanga mouth,DWS,1h
+```
+
+`crs` is per row and mandatory. SAWS and DWS coordinates often arrive in lat/lon;
+declaring the CRS makes the reprojection to UTM36S deterministic rather than
+guessed, and a manifest mixing lat/lon and UTM rows works as-is.
+
+`native_step` is optional but **set it whenever you know the resolution** — see
+4.5. Row order here fixes the column order of `W` and of `readings`. Extra
+columns are carried through untouched, which is how the 4.1 adapter's `device`
+and `in_mask` ride along without disturbing anything downstream.
+
+**`measurements.csv`** — long format, one row per reading:
+
+```
+datetime,gauge_id,rainfall_mm
+2024-01-01 00:05,0241078,0.2
+2024-01-01 00:10,0241078,0.0
+```
+
+Long rather than one column per gauge, because gauges rarely share a clock.
+Ragged records and gaps cost nothing in this shape. A blank `rainfall_mm` is a
+**gap**, not a dry reading, and is carried as such; a negative value is rejected
+outright, since it is almost always a `-9999` no-data sentinel.
+
+### 4.3 End to end, in Python
+
+The `forcing` CLI above is a thin wrapper over this sequence. Reach for the
+library form when you want to inspect `coverage` before committing, hold `W` to
+reuse across events, or drive the stage from a notebook.
+
+```python
+import numpy as np
+from topkapi_setup.forcing import gauges as gg, interpolate as ip, rainfields as rf
+
+TERRAIN = "projects/umhlanga/terrain"
+MASK    = f"{TERRAIN}/mask.tif"
+PARAM   = "projects/umhlanga/cell_param.dat"
+
+# 1. Gauges, reprojected to the model CRS.
+man  = gg.read_manifest("projects/umhlanga/data/manifest.csv")
+meas = gg.read_measurements("projects/umhlanga/data/measurements.csv")
+
+# 2. The clock. Interval-ending: the value at 08:00 covers (07:00, 08:00].
+tl = gg.Timeline("2024-01-01 01:00", "2024-02-01 00:00", dt_seconds=3600)
+
+# 3. Every gauge onto that clock, with gaps flagged.
+readings, available = gg.align_to_clock(
+    meas, tl, man.index,
+    native_steps=man["native_step"].dropna().to_dict(),
+)
+print(gg.coverage(available, man.index, tl))     # look at this before going on
+
+# 4. The weight table, built once from the catchment geometry.
+cell_xy = np.column_stack(ip.catchment_cell_xy(MASK))
+W = ip.build_weights(cell_xy, gg.gauge_xy(man), method="idw")
+
+# 5. Field to disk, with the cell-order guard armed.
+rf.build_and_write_rainfields(
+    "projects/umhlanga/forcing/rainfields.h5", W, readings, available,
+    group_name="ohlanga_jan2024",
+    mask_path=MASK, cell_param_path=PARAM, timeline=tl,
+)
+```
+
+`group_name` must match `group_name` in the simulation `.ini`; the solver reads
+`/{group_name}/rainfall`.
+
+Several events can share one file, but the two writers differ on this and the
+difference is sharp. `build_and_write_rainfields` always appends: it replaces
+its own group and leaves the others alone. `write_rainfields` defaults to
+`overwrite=True`, which opens the file in `"w"` mode and **truncates it** — a
+second call with a new `group_name` destroys the first group without a word.
+Pass `overwrite=False` when adding a group beside an existing one.
+
+### 4.4 Choosing an interpolation method
+
+| Method | How it fills `W` | When |
+|---|---|---|
+| `mean` | every cell takes `1/n` from every gauge | sanity baseline; a single gauge |
+| `thiessen` | each cell takes 100% from its nearest gauge | quick and robust, few gauges |
+| `idw` | weights fall off with distance | **default** for a typical network |
+| `kriging` | weights from a fitted variogram | well-gauged catchments |
+
+```python
+W = ip.build_weights(cell_xy, gg.gauge_xy(man), method="idw", power=2.0)
+W = ip.build_weights(cell_xy, gg.gauge_xy(man), method="thiessen")
+```
+
+**Kriging** needs roughly 15–30 gauges in range for a stable variogram — rare on
+a small coastal catchment, normal on the large inland ones. A variogram is a
+property of the rainfall field, not of the geometry, so it cannot come from
+coordinates alone: pass `sample_values`, one representative reading per gauge
+(a wet-period mean), and the model is fitted once and held fixed for the whole
+record so `W` stays a build-once table.
+
+```python
+sample = readings[readings.sum(axis=1) > 0].mean(axis=0)     # wet-period mean
+W = ip.build_weights(cell_xy, gg.gauge_xy(man), method="kriging",
+                     sample_values=sample)                    # needs pykrige
+```
+
+Without `sample_values` you get an explicit spherical model (`range_m`, `sill`)
+— a smooth distance-decay surface, honestly not a fitted one, and it runs with
+no `pykrige` installed. Kriging weights are legitimately negative for screened
+gauges, which would give negative rainfall, so they are clipped and renormalised
+by default; pass `non_negative=False` for the exact solution.
+
+**Isohyetal** is not a fifth method. Drawn faithfully by machine, those smooth
+contours *are* the IDW or kriging surface, so it belongs in the plotter as
+contours over the field, not as a separate `W`-builder.
+
+**Out-of-catchment gauges.** Do not clip gauges to the catchment boundary — the
+ones just outside constrain the field exactly where the constraint is most
+useful. `W` has a row per in-mask cell and a column per gauge within a buffer,
+so the result is already masked. The buffer only stops a gauge 200 km away from
+dragging on the fit. If the manifest was built with 4.1, this scoping is already
+applied; `select_gauges` re-runs it at interpolation time, tighter if you want.
+
+```python
+keep = ip.select_gauges(gg.gauge_xy(man), cell_xy, buffer_m=30_000)
+man = man.iloc[keep]
+```
+
+### 4.5 The clock, and two traps in it
+
+`Timeline` is the single clock for rainfall, ET and point inflows, so the three
+forcing files cannot silently disagree. Its convention is **interval-ending**:
+the value stamped `t` is the accumulation over `(t - Dt, t]`. `Dt` is a fixed
+number of seconds, because `global_param.dat`'s `Dt` is — calendar months are
+not expressible, so "monthly" means a 30-day step and February is short.
+
+Each gauge is resampled from its own native step: finer than `Dt` aggregates,
+coarser disaggregates. Two things bite here.
+
+**Declare the native step.** Inference reads the modal spacing of the stamps,
+and a gappy record defeats it: an hourly gauge that reported only at 01:00 and
+03:00 looks two-hourly, and its totals get *spread* across the missing hour
+instead of that hour being a gap. Declaring the step keeps it honest.
+
+```python
+gg.align_to_clock(meas, tl, man.index, native_steps={"0241078": "5min"})
+```
+
+**Partial bins.** Going from 5-minute ticks to an hourly `Dt`, an hour holding
+only 1 of its 12 ticks is not a light hour — it is a gap that happens to contain
+a reading, and summing it is a silent under-catch spread through the record. A
+bin must hold `min_coverage` (default 0.8) of its expected readings or it
+becomes a gap. Partial bins are dropped rather than scaled up: rainfall is
+intermittent, so the minutes that recorded are not a fair sample of the ones
+that did not.
+
+```python
+gg.align_to_clock(meas, tl, man.index, min_coverage=0.8)   # 0.0 disables
+```
+
+Gaps are handled as a column operation: the offline gauge's weight is zeroed and
+the surviving gauges' weights renormalised for those steps. Nothing else in the
+pipeline special-cases a gap.
+
+**Disaggregation is a modelling decision, not a resample.** It only arises when
+a record is coarser than `Dt` — with 5-minute Ohlanga data at hourly `Dt` it
+never does. Splitting a daily total across the hours uniformly conserves mass
+but flattens the peak, which on a flashy catchment is the quantity of interest,
+so it warns. Pass a fine-resolution `shape` series — IMERG half-hourly is the
+intended source — and the gauge sets the volume while the satellite sets the
+timing.
+
+```python
+gg.align_to_clock(meas, tl, man.index, shape=imerg_hourly)   # imerg_hourly: a Series on tl.times
+```
+
+### 4.6 The cell-order guard — do not skip it
+
+Column `j` of `rainfields.h5` is the cell on line `j` of `cell_param.dat`.
+Nothing in the file records that, and the solver cannot check it: a permuted
+field runs to completion and produces a plausible hydrograph that is wrong
+everywhere. Same failure class as the parallel-routing race and the CWQM
+`read_river` column bug.
+
+Passing `mask_path` and `cell_param_path` to either writer compares the
+mask-derived coordinates against columns 1–2 of `cell_param.dat` and refuses to
+write on any mismatch — permutation, reversal, an x/y swap, a count mismatch. It
+costs about 0.3 s on the 90,770-cell Ohlanga catchment. There is no good reason
+to omit it.
+
+```python
+rf.check_cell_order(MASK, PARAM)     # returns the cell count, or raises
+```
+
+If it raises a count mismatch, the mask and `cell_param.dat` came from different
+terrain runs; rebuild `cell_param.dat` from this mask.
+
+### 4.7 Size, and which writer to use
+
+The field is large, and it scales with cells × timesteps. Measured on the real
+Ohlanga catchment (90,770 cells at 30 m, hourly):
+
+| Record | On disk (`float32`) |
+|---|---|
+| 1 month | 270 MB |
+| 1 year | 3.2 GB |
+
+Roughly double that in RAM while it is computed in double precision. Two
+writers:
+
+```python
+rf.write_rainfields(path, field, ...)              # short events, testing
+rf.build_and_write_rainfields(path, W, readings, available, ...)   # anything longer
+```
+
+`build_and_write_rainfields` streams in time blocks and never holds the whole
+array — peak 0.55 GB on a month of real geometry, output byte-identical to the
+in-memory path. Use it beyond a few months.
+
+Compression is off by default and is not worth turning on: IDW puts a little
+rain in nearly every cell, so the field is dense float noise rather than sparse.
+On the real month, gzip recovered 15% for a 3× slower write. If the files are
+still too big, the lever is a coarser grid or a longer `Dt`, not compression —
+both cut the array itself.
+
+Read it back the way the solver does:
+
+```python
+field = rf.read_rainfields("…/rainfields.h5", group_name="ohlanga_jan2024")
+```
+
+### 4.8 Gotchas
+
+- **Manifest row order is load-bearing.** It fixes the columns of `W`,
+  `readings` and `available`. Take all three from the same frame — pass
+  `man.index` to `align_to_clock` — and they cannot drift. A gauge with no data
+  stays as an all-unavailable column rather than vanishing, for this reason.
+- **A file that changes datetime format mid-record** loses rows silently in
+  pandas, which infers one format and coerces the rest to `NaT`. The reader
+  falls back to per-value parsing when it sees this.
+- **A clock not starting on a round boundary** used to wipe the record: pandas
+  anchors resample bins to midnight. The resample is anchored to the timeline
+  now, but it is why `aggregate` is tested across `Dt` from 15 minutes to
+  30 days.
+- **A timestep where no gauge reports at all** is refused rather than guessed.
+  Trim the timeline to the period the network covers, or fill from a gridded
+  product. (This is why the 4.1 collector zero-fills dry hours rather than
+  leaving them as gaps: a report-by-exception feed would otherwise make almost
+  every dry timestep all-gap.)
+- **A window that overshoots the record** is the common form of the above: ask
+  for `--end` a few hours past the last reading and those tail steps have no
+  gauge. `forcing` catches this up front — before building the weight matrix —
+  and names the last covered stamp so the fix is a copy-paste `--end`. Pass
+  `--trim` to clip the window to the covered span automatically. Only *edge*
+  overshoot is trimmed; an interior hour no gauge covers is always refused,
+  since the network genuinely cannot fill it.
+- **Check `coverage()` before building the field.** A gauge at 3% is a clock or
+  unit problem, not a broken instrument, and it is far cheaper to catch here
+  than in calibration.
+
+### 4.9 Look at the field — `viz`
+
+The same `viz` command that renders terrain and params renders a `rainfields.h5`.
+Point it at the file (not a directory) and give it the mask; it auto-detects the
+rain view.
+
+```bash
+# One timestep: field on the catchment grid, the divide traced over it, and each
+# gauge coloured by its own reading (pass --measurements) on the same scale.
+python -m topkapi_setup.viz projects/umhlanga/forcing/rainfields.h5 \
+    --mask         projects/umhlanga/terrain/mask.tif \
+    --manifest     projects/umhlanga/forcing/gauge_manifest.csv \
+    --measurements projects/umhlanga/forcing/measurements.csv \
+    --t -1 \
+    --out projects/umhlanga/forcing/rainfield.png
+
+# The QC montage: the N wettest steps on a shared colour scale.
+python -m topkapi_setup.viz projects/umhlanga/forcing/rainfields.h5 \
+    --mask projects/umhlanga/terrain/mask.tif \
+    --manifest projects/umhlanga/data/manifest.csv \
+    --montage 6 \
+    --out projects/umhlanga/forcing/rainfield_montage.png
+```
+
+| Flag | Purpose |
+|---|---|
+| `--mask` | terrain mask (required — it fixes the grid the field is scattered onto) |
+| `--group` | HDF5 group; omit when the file holds only one |
+| `--t` | timestep to draw: an index (`-1`) or a datetime (`"2025-01-05 02:00"`, snapped to nearest step) |
+| `--montage N` | draw the N wettest steps instead of one |
+| `--at T…` | montage these specific steps (indices or datetimes), in order — e.g. the hours across a storm |
+| `--manifest` | overlay gauge markers (a double ring flags in-mask gauges) |
+| `--measurements` | colour each gauge by its reading at that step, on the field scale |
+| `--vmax` | pin the top of the colour scale (mm), for comparing figures |
+
+What to read off it: the field should shade toward the wet gauges, the divide
+should close on the catchment, and a gauge whose colour clashes with the cells
+around it is the first sign of a bad reading or a misplaced coordinate. The view
+frames on the catchment, so a gauge far out in the buffer sits at the edge rather
+than shrinking the catchment to a dot. Colouring gauges on the field's own scale
+is the isohyetal check the design note describes — a faithful contour reading of
+the IDW surface, without a separate code path.
+
+---
 ## Writing new stages
 
 Keep the contract every module here follows, so this file and `--help` stay the
@@ -300,6 +759,6 @@ A module is not "done" until (1)–(5) hold and the suite is green.
 | M0 | env + housekeeping | `conda env create` | done |
 | M1 | preflight / terrain / viz | `preflight`, `terrain`, `viz` | done |
 | M2 | parameter rasters | `params`, `soil_table` | done |
-| M3 | forcing builder | `forcing` | to do |
+| M3 | forcing builder (rainfall) | `forcing`, `forcing.sources.*` | done |
 | M4 | config + run (`--check`) | `config`, `run` | to do |
 | M5 | calibration | `calibrate` | to do |

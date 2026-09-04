@@ -47,5 +47,9 @@ projects/*/data/
 projects/*/terrain/
 projects/*/soil/
 projects/*/results/
+projects/*/forcing/
+projects/*/figs/
+projects/*/raw/
+projects/*/soil/
 # NOTE: example_simulation/results/ is deliberately NOT ignored — it is
 # the committed regression fixture for the Liebenbergsvlei example.
