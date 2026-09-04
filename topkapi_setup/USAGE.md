@@ -285,10 +285,12 @@ rainfall depth in mm for every cell at every step, in the **same cell order**
 `cell_param.dat` uses. That file plus `ET.h5` and `global_param.dat` is what the
 solver runs on.
 
-> **No CLI yet.** Unlike `preflight`/`terrain`/`params`, this stage is library
-> functions only — there is no `python -m topkapi_setup.forcing`. Use it from a
-> script or notebook as below. The CLI and the `forcing_manifest.json` are
-> outstanding against the contract in *Writing new stages*.
+> **Partial CLI.** The gauge sources in 4.1 (`gauge_manifest`, `ethekwini_fews`)
+> are CLIs. The field builder itself — turning the two input files into
+> `rainfields.h5` — is still library functions only; there is no
+> `python -m topkapi_setup.forcing`, so drive 4.3 from a script or notebook. That
+> CLI and the `forcing_manifest.json` remain outstanding against the contract in
+> *Writing new stages*.
 
 ```
 manifest.csv ─┐
@@ -305,9 +307,88 @@ the gauges. That geometry never changes, so the weight table `W` is built once
 and reused for every timestep. Choosing an interpolation method means choosing
 how `W` is filled — nothing downstream changes.
 
-### 4.1 The two input files
+### 4.1 Sourcing gauges from eThekwini FEWS
 
-Coordinates live apart from the series, mirroring the CWQM river contract.
+The two input files in 4.2 can be handed in directly, or built from the
+eThekwini FEWS network with two adapters under `topkapi_setup/forcing/sources/`.
+Both are thin CLIs; run them in order.
+
+```
+gauges_raw.json ──gauge_manifest──▶ manifest.csv ──ethekwini_fews──▶ measurements.csv
+```
+
+**Scope the network to the catchment — `gauge_manifest`.** Reprojects every
+station to the mask's CRS, keeps those within a buffer of the delineated
+catchment, and writes the manifest.
+
+```bash
+python -m topkapi_setup.forcing.sources.gauge_manifest \
+    --network projects/umhlanga/raw/gauges_raw.json \
+    --mask    projects/umhlanga/terrain/mask.tif \
+    --out     projects/umhlanga/data/manifest.csv \
+    --buffer-km 20
+```
+
+`--network` is the FEWS station dump saved verbatim (the API returns a
+Python-literal string, not strict JSON; both parse). `--mask` is the `terrain.py`
+mask and must be projected in metres — the buffer distance and the output
+coordinates are metres in its CRS. The output carries two extra columns beyond
+4.2's contract: `device` (the instrument serial, provenance only) and `in_mask`.
+
+Keep the buffer. A gauge just outside the divide still constrains the field at
+the edge, where the constraint is most useful; `in_mask` records whether a gauge
+is strictly inside the catchment or doing that boundary work. Both belong in the
+manifest, so this is the coarse scoping step — not `select_gauges` (4.4), which
+is a finer per-run choice layered on top.
+
+**Pull the series — `ethekwini_fews`.** Fetches each gauge in the manifest over a
+date window and writes `measurements.csv`.
+
+```bash
+export ETHEKWINI_FEWS_KEY=…            # Authorization header, never the URL
+python -m topkapi_setup.forcing.sources.ethekwini_fews \
+    --manifest  projects/umhlanga/data/manifest.csv \
+    --start 20250101 --end 20250131 \
+    --out       projects/umhlanga/data/measurements.csv \
+    --cache-dir projects/umhlanga/raw/fews
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--cache-dir` | none | raw JSON per gauge-window; provenance, and resumes a run |
+| `--step` | `1h` | emit grid; no coarser than `Dt` |
+| `--gap-threshold` | `12h` | a longer silence is a gap, a shorter one is dry; `none` disables |
+| `--min-interval` | `1.0` | seconds between requests; raise it if `429` persists |
+| `--auth-scheme` | `bearer` | Authorization header scheme |
+
+Three things about this feed, all handled by the adapter:
+
+- **Auth is `Bearer <key>`** from `$ETHEKWINI_FEWS_KEY`. A `401` means the key is
+  absent in the shell you ran from.
+- **It rate-limits.** Requests are paced `--min-interval` apart and a `429`/`503`
+  is retried with backoff, honouring `Retry-After`; with `--cache-dir` set a
+  throttled run resumes rather than restarting.
+- **It reports by exception** — a row per tip during rain, only a sparse
+  heartbeat when dry. The collector fills dry hours the gauge was demonstrably
+  alive through with `0` and reserves a gap for silences past `--gap-threshold`,
+  so a dry hour is never mistaken for missing data. (Left raw, every dry hour
+  would read as a gap and the field would refuse to assemble — see the last
+  gotcha in 4.8.)
+
+Because the collector emits on a regular `--step` grid, these gauges' native step
+*is* that grid (`1h` by default), so they need no `native_step` entry in 4.5.
+
+**Timezone — confirm before calibration.** Stamps come from the feed's `tstr`
+field, the UTC rendering of its epoch. Whether that wall-clock is genuinely UTC
+or a local (SAST) clock labelled as UTC is not knowable from the data. Stamps are
+emitted naive — set the zone once on `Timeline` (`tz="Africa/Johannesburg"` if
+local) and pin it against a storm's known onset. A silent 2 h offset is invisible
+in totals and wrong against tides and DWS flow.
+
+### 4.2 The two input files
+
+Coordinates live apart from the series, mirroring the CWQM river contract. Build
+them with 4.1, or supply them yourself in these formats.
 
 **`manifest.csv`** — one row per gauge:
 
@@ -322,7 +403,9 @@ declaring the CRS makes the reprojection to UTM36S deterministic rather than
 guessed, and a manifest mixing lat/lon and UTM rows works as-is.
 
 `native_step` is optional but **set it whenever you know the resolution** — see
-4.4. Row order here fixes the column order of `W` and of `readings`.
+4.5. Row order here fixes the column order of `W` and of `readings`. Extra
+columns are carried through untouched, which is how the 4.1 adapter's `device`
+and `in_mask` ride along without disturbing anything downstream.
 
 **`measurements.csv`** — long format, one row per reading:
 
@@ -337,7 +420,7 @@ Ragged records and gaps cost nothing in this shape. A blank `rainfall_mm` is a
 **gap**, not a dry reading, and is carried as such; a negative value is rejected
 outright, since it is almost always a `-9999` no-data sentinel.
 
-### 4.2 End to end
+### 4.3 End to end
 
 ```python
 import numpy as np
@@ -383,7 +466,7 @@ its own group and leaves the others alone. `write_rainfields` defaults to
 second call with a new `group_name` destroys the first group without a word.
 Pass `overwrite=False` when adding a group beside an existing one.
 
-### 4.3 Choosing an interpolation method
+### 4.4 Choosing an interpolation method
 
 | Method | How it fills `W` | When |
 |---|---|---|
@@ -424,14 +507,15 @@ contours over the field, not as a separate `W`-builder.
 ones just outside constrain the field exactly where the constraint is most
 useful. `W` has a row per in-mask cell and a column per gauge within a buffer,
 so the result is already masked. The buffer only stops a gauge 200 km away from
-dragging on the fit.
+dragging on the fit. If the manifest was built with 4.1, this scoping is already
+applied; `select_gauges` re-runs it at interpolation time, tighter if you want.
 
 ```python
 keep = ip.select_gauges(gg.gauge_xy(man), cell_xy, buffer_m=30_000)
 man = man.iloc[keep]
 ```
 
-### 4.4 The clock, and two traps in it
+### 4.5 The clock, and two traps in it
 
 `Timeline` is the single clock for rainfall, ET and point inflows, so the three
 forcing files cannot silently disagree. Its convention is **interval-ending**:
@@ -479,7 +563,7 @@ timing.
 gg.align_to_clock(meas, tl, man.index, shape=imerg_hourly)   # imerg_hourly: a Series on tl.times
 ```
 
-### 4.5 The cell-order guard — do not skip it
+### 4.6 The cell-order guard — do not skip it
 
 Column `j` of `rainfields.h5` is the cell on line `j` of `cell_param.dat`.
 Nothing in the file records that, and the solver cannot check it: a permuted
@@ -500,7 +584,7 @@ rf.check_cell_order(MASK, PARAM)     # returns the cell count, or raises
 If it raises a count mismatch, the mask and `cell_param.dat` came from different
 terrain runs; rebuild `cell_param.dat` from this mask.
 
-### 4.6 Size, and which writer to use
+### 4.7 Size, and which writer to use
 
 The field is large, and it scales with cells × timesteps. Measured on the real
 Ohlanga catchment (90,770 cells at 30 m, hourly):
@@ -534,7 +618,7 @@ Read it back the way the solver does:
 field = rf.read_rainfields("…/rainfields.h5", group_name="ohlanga_jan2024")
 ```
 
-### 4.7 Gotchas
+### 4.8 Gotchas
 
 - **Manifest row order is load-bearing.** It fixes the columns of `W`,
   `readings` and `available`. Take all three from the same frame — pass
@@ -549,11 +633,12 @@ field = rf.read_rainfields("…/rainfields.h5", group_name="ohlanga_jan2024")
   30 days.
 - **A timestep where no gauge reports at all** is refused rather than guessed.
   Trim the timeline to the period the network covers, or fill from a gridded
-  product.
+  product. (This is why the 4.1 collector zero-fills dry hours rather than
+  leaving them as gaps: a report-by-exception feed would otherwise make almost
+  every dry timestep all-gap.)
 - **Check `coverage()` before building the field.** A gauge at 3% is a clock or
   unit problem, not a broken instrument, and it is far cheaper to catch here
   than in calibration.
-
 
 ---
 ## Writing new stages
