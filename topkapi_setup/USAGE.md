@@ -285,21 +285,60 @@ rainfall depth in mm for every cell at every step, in the **same cell order**
 `cell_param.dat` uses. That file plus `ET.h5` and `global_param.dat` is what the
 solver runs on.
 
-> **Partial CLI.** The gauge sources in 4.1 (`gauge_manifest`, `ethekwini_fews`)
-> are CLIs. The field builder itself — turning the two input files into
-> `rainfields.h5` — is still library functions only; there is no
-> `python -m topkapi_setup.forcing`, so drive 4.3 from a script or notebook. That
-> CLI and the `forcing_manifest.json` remain outstanding against the contract in
-> *Writing new stages*.
-
 ```
 manifest.csv ─┐
               ├─▶ W (n_cells × n_gauges)  ─┐
    mask.tif ──┘      build once             ├─▶ field ─▶ rainfields.h5
-                                            │
+                                            │            + forcing_manifest.json
 measurements.csv ─▶ readings (n_t × n_gauges)┘
                     + availability
 ```
+
+**One command builds the file.** Given the two input files (4.2, or sourced via
+4.1) and the terrain mask, `forcing` runs the whole stage — align to the clock,
+build `W`, interpolate, and write `rainfields.h5` with the cell-order guard
+armed — and drops a `forcing_manifest.json` beside it.
+
+```bash
+python -m topkapi_setup.forcing \
+    --manifest     projects/umhlanga/forcing/gauge_manifest.csv \
+    --measurements projects/umhlanga/forcing/measurements.csv \
+    --mask         projects/umhlanga/terrain/mask.tif \
+    --cell-param   projects/umhlanga/cell_param.dat \
+    --start "2025-01-01 01:00" --end "2025-02-01 00:00" --dt 3600 \
+    --method idw --group ohlanga_jan2025 \
+    --out projects/umhlanga/forcing/rainfields.h5
+```
+```bash
+python -m topkapi_setup.forcing \
+    --manifest projects/umhlanga/forcing/gauge_manifest.csv \
+    --measurements projects/umhlanga/forcing/measurements.csv \
+    --mask projects/umhlanga/terrain/mask.tif --cell-param projects/umhlanga/cell_param.dat \
+    --start "2025-01-01 01:00" --end "2025-02-01 00:00" --dt 3600 \
+    --group ohlanga_jan2025 --trim \
+    --out projects/umhlanga/forcing/rainfields.h5
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--cell-param` | none | arms the cell-order guard — **pass it** (see 4.6) |
+| `--start`/`--end` | — | first/last interval-ending stamp on the clock |
+| `--dt` | `3600` | model timestep, seconds; must match `global_param` `Dt` |
+| `--tz` | naive | e.g. `Africa/Johannesburg`; set it consistently |
+| `--group` | `sample_event` | HDF5 group; must match `group_name` in the sim `.ini` |
+| `--method` | `idw` | `mean`/`thiessen`/`idw`/`kriging` (see 4.4) |
+| `--buffer-km` | all | per-run: keep only gauges within this range of the catchment |
+| `--min-coverage` | `0.8` | bin completeness when aggregating (4.5) |
+| `--block-size` | `720` | timesteps per write block (4.7) |
+| `--trim` | off | clip the window to the gauge record if it overshoots at either end |
+| `--no-guard` | off | skip the cell-order guard — don't |
+
+The run prints a one-line summary — steps × cells, gauges used, per-gauge
+coverage, and the wettest step — and everything it did lands in
+`forcing_manifest.json` (output paths, CRS, cell/gauge counts, method + params,
+the clock, coverage per gauge, and peak-field stats) for the next stage and for
+`viz` to read. If you need finer control than the flags expose, 4.3 is the same
+sequence as library calls.
 
 The one idea worth holding: rainfall on a cell is a **weighted blend of the
 gauge readings**, and the weights depend only on where the cell sits relative to
@@ -325,7 +364,7 @@ catchment, and writes the manifest.
 python -m topkapi_setup.forcing.sources.gauge_manifest \
     --network projects/umhlanga/raw/gauges_raw.json \
     --mask    projects/umhlanga/terrain/mask.tif \
-    --out     projects/umhlanga/data/manifest.csv \
+    --out     projects/umhlanga/forcing/gauge_manifest.csv \
     --buffer-km 20
 ```
 
@@ -420,7 +459,11 @@ Ragged records and gaps cost nothing in this shape. A blank `rainfall_mm` is a
 **gap**, not a dry reading, and is carried as such; a negative value is rejected
 outright, since it is almost always a `-9999` no-data sentinel.
 
-### 4.3 End to end
+### 4.3 End to end, in Python
+
+The `forcing` CLI above is a thin wrapper over this sequence. Reach for the
+library form when you want to inspect `coverage` before committing, hold `W` to
+reuse across events, or drive the stage from a notebook.
 
 ```python
 import numpy as np
@@ -636,9 +679,59 @@ field = rf.read_rainfields("…/rainfields.h5", group_name="ohlanga_jan2024")
   product. (This is why the 4.1 collector zero-fills dry hours rather than
   leaving them as gaps: a report-by-exception feed would otherwise make almost
   every dry timestep all-gap.)
+- **A window that overshoots the record** is the common form of the above: ask
+  for `--end` a few hours past the last reading and those tail steps have no
+  gauge. `forcing` catches this up front — before building the weight matrix —
+  and names the last covered stamp so the fix is a copy-paste `--end`. Pass
+  `--trim` to clip the window to the covered span automatically. Only *edge*
+  overshoot is trimmed; an interior hour no gauge covers is always refused,
+  since the network genuinely cannot fill it.
 - **Check `coverage()` before building the field.** A gauge at 3% is a clock or
   unit problem, not a broken instrument, and it is far cheaper to catch here
   than in calibration.
+
+### 4.9 Look at the field — `viz`
+
+The same `viz` command that renders terrain and params renders a `rainfields.h5`.
+Point it at the file (not a directory) and give it the mask; it auto-detects the
+rain view.
+
+```bash
+# One timestep: field on the catchment grid, the divide traced over it, and each
+# gauge coloured by its own reading (pass --measurements) on the same scale.
+python -m topkapi_setup.viz projects/umhlanga/forcing/rainfields.h5 \
+    --mask         projects/umhlanga/terrain/mask.tif \
+    --manifest     projects/umhlanga/forcing/gauge_manifest.csv \
+    --measurements projects/umhlanga/forcing/measurements.csv \
+    --t -1 \
+    --out projects/umhlanga/forcing/rainfield.png
+
+# The QC montage: the N wettest steps on a shared colour scale.
+python -m topkapi_setup.viz projects/umhlanga/forcing/rainfields.h5 \
+    --mask projects/umhlanga/terrain/mask.tif \
+    --manifest projects/umhlanga/data/manifest.csv \
+    --montage 6 \
+    --out projects/umhlanga/forcing/rainfield_montage.png
+```
+
+| Flag | Purpose |
+|---|---|
+| `--mask` | terrain mask (required — it fixes the grid the field is scattered onto) |
+| `--group` | HDF5 group; omit when the file holds only one |
+| `--t` | timestep to draw: an index (`-1`) or a datetime (`"2025-01-05 02:00"`, snapped to nearest step) |
+| `--montage N` | draw the N wettest steps instead of one |
+| `--at T…` | montage these specific steps (indices or datetimes), in order — e.g. the hours across a storm |
+| `--manifest` | overlay gauge markers (a double ring flags in-mask gauges) |
+| `--measurements` | colour each gauge by its reading at that step, on the field scale |
+| `--vmax` | pin the top of the colour scale (mm), for comparing figures |
+
+What to read off it: the field should shade toward the wet gauges, the divide
+should close on the catchment, and a gauge whose colour clashes with the cells
+around it is the first sign of a bad reading or a misplaced coordinate. The view
+frames on the catchment, so a gauge far out in the buffer sits at the edge rather
+than shrinking the catchment to a dot. Colouring gauges on the field's own scale
+is the isohyetal check the design note describes — a faithful contour reading of
+the IDW surface, without a separate code path.
 
 ---
 ## Writing new stages
@@ -666,6 +759,6 @@ A module is not "done" until (1)–(5) hold and the suite is green.
 | M0 | env + housekeeping | `conda env create` | done |
 | M1 | preflight / terrain / viz | `preflight`, `terrain`, `viz` | done |
 | M2 | parameter rasters | `params`, `soil_table` | done |
-| M3 | forcing builder (rainfall) | `forcing.*` (library only) | done |
+| M3 | forcing builder (rainfall) | `forcing`, `forcing.sources.*` | done |
 | M4 | config + run (`--check`) | `config`, `run` | to do |
 | M5 | calibration | `calibrate` | to do |

@@ -10,8 +10,11 @@ Modules land in build order:
 ``interpolate.py``   the ``W``-builders (mean/thiessen/idw/kriging)  present
 ``gauges.py``        manifest + measurements IO, clock, gaps         present
 ``rainfields.py``    the ``(n_t, n_cells)`` writer                   present
+``build.py``         end-to-end CLI (+ ``forcing_manifest.json``)    present
 ``gridded.py``       CHIRPS/IMERG resample onto grid                 to do
 ===================  ============================================  ========
+
+Run the whole stage with ``python -m topkapi_setup.forcing`` (see ``build.py``).
 """
 
 from topkapi_setup.forcing.gauges import (  # noqa: F401
@@ -40,4 +43,8 @@ from topkapi_setup.forcing.interpolate import (  # noqa: F401
     catchment_cell_xy,
     renormalise,
     select_gauges,
+)
+from topkapi_setup.forcing.build import (  # noqa: F401
+    ForcingResult,
+    build_rainfields,
 )
