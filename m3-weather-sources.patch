@@ -1,0 +1,1180 @@
+diff --git a/topkapi_setup/forcing/sources/weather_manifest.py b/topkapi_setup/forcing/sources/weather_manifest.py
+new file mode 100644
+index 0000000..2578d55
+--- /dev/null
++++ b/topkapi_setup/forcing/sources/weather_manifest.py
+@@ -0,0 +1,325 @@
++"""Scope an eThekwini weather-station network to a catchment and write the
++toolkit weather manifest.
++
++Suggested home: ``topkapi_setup/forcing/sources/weather_manifest.py`` -- the ET
++twin of :mod:`gauge_manifest`.  Where the rain manifest scopes tipping-bucket
++gauges, this scopes the FEWS **weather** stations (temperature, humidity, wind,
++radiation) that feed the ET forcing (:func:`ETr`/:func:`ETo`, M3 ET note).
++
++The station list is a live endpoint rather than a static dump::
++
++    GET https://data.ethekwinifews.durban/api/v1/stations
++        Accept: application/json
++        Authorization: Bearer <key>     # from $ETHEKWINI_FEWS_KEY, not the URL
++
++so :func:`build_manifest` fetches it when no ``network`` is handed in, and still
++accepts a saved dump (path / string / list) for offline reruns and tests.
++
++Written manifest (the ET note's contract, with two carried columns)::
++
++    station_id, x, y, crs, elevation_m, name, source, device, in_mask
++
++Two things differ from the rain manifest:
++
++* **Filter on ``devices.weather``.**  A station is kept only if it carries a
++  non-empty ``weather`` device serial.  The weather-less placeholders in the
++  dump (e.g. ``UMHLANGA BEACH``, ``DBN Point``, ``Point - Pump Station``) are
++  dropped -- they report no weather and would only add empty columns.
++
++* **``elevation_m`` is filled from the DEM, not the API.**  The station payload
++  carries no elevation, yet FAO-56 needs it: air pressure -- hence the
++  psychrometric constant gamma, hence ET0 -- depends on station height.  So
++  :func:`build_manifest` samples the terrain DEM at each station.  A station
++  outside the DEM footprint (a far buffer station) is left ``NaN`` with a
++  warning rather than given a fake sea-level height; the ET stage can fall back
++  to the temperature-only Hargreaves method for such a station.
++
++The catchment geometry (:func:`~gauge_manifest.scope_to_catchment`,
++:func:`~gauge_manifest.catchment_polygon`) is source-agnostic and reused
++verbatim -- only :func:`parse_ethekwini_weather` and the ``/stations`` fetch
++know this feed.
++"""
++
++from __future__ import annotations
++
++import ast
++import json
++import os
++import warnings
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import rasterio
++import requests
++from pyproj import Transformer
++
++# Reuse the source-agnostic scoping geometry from the rain twin: same buffer,
++# same point-in-catchment test, same in_mask semantics.  Nothing rain-specific
++# lives in these, so importing keeps one implementation.
++from .gauge_manifest import (
++    DEFAULT_BUFFER_M,
++    catchment_polygon,          # noqa: F401  (re-exported for symmetry/tests)
++    scope_to_catchment,
++)
++
++__all__ = [
++    "STATIONS_URL",
++    "API_KEY_ENV",
++    "MANIFEST_COLUMNS",
++    "DEFAULT_BUFFER_M",
++    "DEFAULT_SOURCE",
++    "fetch_network",
++    "parse_ethekwini_weather",
++    "sample_elevation",
++    "build_manifest",
++]
++
++STATIONS_URL = "https://data.ethekwinifews.durban/api/v1/stations"
++API_KEY_ENV = "ETHEKWINI_FEWS_KEY"
++
++#: Columns written, in order.  The first seven are the ET-note manifest
++#: contract; device and in_mask are carried through (device is the physical
++#: weather-instrument serial, kept for provenance).
++MANIFEST_COLUMNS = ("station_id", "x", "y", "crs", "elevation_m", "name",
++                    "source", "device", "in_mask")
++
++DEFAULT_SOURCE = "eThekwini_FEWS"
++
++
++# ---------------------------------------------------------------------------
++# Source-specific: fetch and parse the /stations dump
++# ---------------------------------------------------------------------------
++
++def fetch_network(*, api_key=None, session=None, timeout=60,
++                  auth_scheme="bearer"):
++    """GET the live station list from ``/api/v1/stations``.
++
++    Returns the parsed JSON (a list of station dicts).  The key is read from
++    ``$ETHEKWINI_FEWS_KEY`` and sent in the ``Authorization`` header, never in
++    the URL.
++    """
++    api_key = api_key or os.environ.get(API_KEY_ENV)
++    if not api_key:
++        raise RuntimeError(
++            f"no API key: set ${API_KEY_ENV} or pass api_key=. The key goes in "
++            "the Authorization header, never in the URL."
++        )
++    scheme = (auth_scheme or "bearer").lower()
++    prefix = {"bearer": "Bearer ", "token": "Token ", "raw": ""}.get(scheme)
++    if prefix is None:
++        raise ValueError(f"unknown auth_scheme {auth_scheme!r}")
++
++    sess = session or requests.Session()
++    resp = sess.get(STATIONS_URL,
++                    headers={"Accept": "application/json",
++                             "Authorization": f"{prefix}{api_key}"},
++                    timeout=timeout)
++    resp.raise_for_status()
++    return resp.json()
++
++
++def _is_existing_path(value):
++    """True if ``value`` names an existing file.
++
++    A raw JSON/literal dump is far longer than any path and makes ``Path.exists``
++    raise ``OSError: File name too long`` rather than return ``False`` -- so the
++    check is guarded and a too-long or invalid name is simply "not a path".
++    """
++    try:
++        return Path(str(value)).exists()
++    except OSError:
++        return False
++
++
++def parse_ethekwini_weather(network):
++    """Parse the eThekwini station dump to a tidy weather-station table.
++
++    ``network`` is a path, a raw string, or an already-parsed list.  The dump
++    sometimes arrives as a Python-literal string (single quotes) rather than
++    strict JSON, so a ``literal_eval`` fallback is kept, mirroring the rain
++    parser.  Only stations with a non-empty ``devices.weather`` serial are
++    kept.
++
++    Returns
++    -------
++    DataFrame with columns ``station_id, name, lon, lat, device``.
++    """
++    if isinstance(network, (str, Path)) and _is_existing_path(network):
++        network = Path(network).read_text()
++    if isinstance(network, str):
++        try:
++            records = json.loads(network)
++        except json.JSONDecodeError:
++            records = ast.literal_eval(network)
++    else:
++        records = network
++
++    rows = []
++    for r in records:
++        device = (r.get("devices") or {}).get("weather", "")
++        if not device:                          # weather-less placeholder
++            continue
++        rows.append({
++            "station_id": str(r["id"]).strip(),
++            "name": str(r.get("name", "")).replace(" WX", "").strip(),
++            "lon": float(r["longitude"]),
++            "lat": float(r["latitude"]),
++            "device": device,
++        })
++    df = pd.DataFrame(rows,
++                      columns=["station_id", "name", "lon", "lat", "device"])
++    dupes = df["station_id"][df["station_id"].duplicated()].unique()
++    if len(dupes):
++        raise ValueError(
++            f"duplicate station_id in network dump: {', '.join(dupes)}")
++    return df
++
++
++# ---------------------------------------------------------------------------
++# Elevation from the DEM
++# ---------------------------------------------------------------------------
++
++def sample_elevation(df, dem_path, *, x_col="x", y_col="y", crs=None):
++    """Return an ``elevation_m`` Series sampled from ``dem_path`` at each row.
++
++    Station coordinates are expected in the manifest ``crs`` (the mask/DEM CRS);
++    if the DEM is in a different CRS they are reprojected first.  A station off
++    the DEM footprint, or over a nodata cell, comes back ``NaN`` (with a
++    warning) rather than a fabricated height.
++    """
++    if df.empty:
++        return pd.Series(dtype=float)
++
++    with rasterio.open(dem_path) as ds:
++        xs = df[x_col].to_numpy(float)
++        ys = df[y_col].to_numpy(float)
++        if crs is not None and ds.crs is not None and \
++                str(ds.crs).upper() != str(crs).upper():
++            tx = Transformer.from_crs(str(crs), ds.crs, always_xy=True)
++            xs, ys = tx.transform(xs, ys)
++
++        nodata = ds.nodata
++        left, bottom, right, top = ds.bounds
++        vals = []
++        for xi, yi, sample in zip(xs, ys, ds.sample(zip(xs, ys))):
++            v = float(sample[0])
++            inside = (left <= xi <= right) and (bottom <= yi <= top)
++            if (not inside) or (nodata is not None and v == nodata) \
++                    or not np.isfinite(v):
++                v = np.nan
++            vals.append(v)
++
++    elev = pd.Series(vals, index=df.index, dtype=float)
++    missing = df.loc[elev.isna(), "station_id"].tolist() \
++        if "station_id" in df.columns else []
++    if missing:
++        warnings.warn(
++            "no DEM elevation for station(s) "
++            f"{', '.join(map(str, missing))} (off the DEM footprint or over "
++            "nodata); elevation_m left NaN -- the ET stage can use the "
++            "temperature-only Hargreaves fallback there.",
++            stacklevel=2,
++        )
++    return elev
++
++
++# ---------------------------------------------------------------------------
++# Orchestration
++# ---------------------------------------------------------------------------
++
++def build_manifest(network, mask_path, out=None, *, dem_path=None,
++                   buffer_m=DEFAULT_BUFFER_M, source=DEFAULT_SOURCE,
++                   api_key=None, session=None):
++    """Scope the weather network to a catchment mask and write the manifest.
++
++    Parameters
++    ----------
++    network : path, str, list, or None
++        A saved ``/stations`` dump.  ``None`` fetches it live from
++        :data:`STATIONS_URL` (needs ``$ETHEKWINI_FEWS_KEY``).
++    mask_path : path
++        Catchment mask raster from ``terrain.py`` (projected CRS).
++    dem_path : path, optional
++        Terrain DEM used to fill ``elevation_m``.  Omit and every elevation is
++        ``NaN`` -- fine for a Hargreaves-only run, not for Penman-Monteith.
++    buffer_m : float
++        Keep stations within this distance of the catchment boundary.
++
++    Returns the manifest DataFrame; also writes it when ``out`` is given.
++    """
++    if network is None:
++        network = fetch_network(api_key=api_key, session=session)
++
++    stations = parse_ethekwini_weather(network)
++    scoped, crs = scope_to_catchment(stations, mask_path, buffer_m=buffer_m)
++
++    if scoped.empty:
++        manifest = pd.DataFrame(columns=list(MANIFEST_COLUMNS))
++    else:
++        scoped["crs"] = crs
++        scoped["source"] = source
++        if dem_path is not None:
++            scoped["elevation_m"] = sample_elevation(
++                scoped, dem_path, crs=crs).round(1)
++        else:
++            scoped["elevation_m"] = np.nan
++            warnings.warn(
++                "no dem_path given; elevation_m is NaN for every station. "
++                "FAO-56 Penman-Monteith needs station elevation -- pass the "
++                "terrain DEM to fill it.",
++                stacklevel=2,
++            )
++        manifest = scoped[list(MANIFEST_COLUMNS)].copy()
++        # In-mask stations first, then alphabetical -- the genuine catchment
++        # stations are what you scan first.
++        manifest = manifest.sort_values(
++            ["in_mask", "name"], ascending=[False, True], ignore_index=True)
++
++    if out is not None:
++        out = Path(out)
++        out.parent.mkdir(parents=True, exist_ok=True)
++        manifest.to_csv(out, index=False)
++
++    return manifest
++
++
++# ---------------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------------
++
++def _cli(argv=None):
++    import argparse
++
++    p = argparse.ArgumentParser(
++        description="Scope the eThekwini weather-station network to a "
++                    "catchment mask and write the toolkit weather manifest.",
++    )
++    p.add_argument("--network", default=None,
++                   help="saved /stations dump; omit to fetch live "
++                        f"(needs ${API_KEY_ENV})")
++    p.add_argument("--mask", required=True,
++                   help="catchment mask raster from terrain.py (projected CRS)")
++    p.add_argument("--dem", default=None,
++                   help="terrain DEM to fill elevation_m (needed for Penman)")
++    p.add_argument("--out", required=True, help="output weather_manifest.csv")
++    p.add_argument("--buffer-km", type=float, default=DEFAULT_BUFFER_M / 1000,
++                   help=f"edge buffer in km (default {DEFAULT_BUFFER_M/1000:g})")
++    p.add_argument("--source", default=DEFAULT_SOURCE,
++                   help="value for the manifest 'source' column")
++    args = p.parse_args(argv)
++
++    manifest = build_manifest(
++        args.network, args.mask, args.out, dem_path=args.dem,
++        buffer_m=args.buffer_km * 1000, source=args.source,
++    )
++    n_in = int(manifest["in_mask"].sum()) if len(manifest) else 0
++    print(f"{len(manifest)} weather stations within {args.buffer_km:g} km "
++          f"({n_in} inside the mask) -> {args.out}")
++    if len(manifest):
++        cols = ["station_id", "name", "elevation_m", "in_mask"]
++        print(manifest[cols].to_string(index=False))
++
++
++if __name__ == "__main__":
++    _cli()
+diff --git a/topkapi_setup/forcing/sources/weather_measurements.py b/topkapi_setup/forcing/sources/weather_measurements.py
+new file mode 100644
+index 0000000..64f98e8
+--- /dev/null
++++ b/topkapi_setup/forcing/sources/weather_measurements.py
+@@ -0,0 +1,525 @@
++"""Fetch weather observations from the eThekwini FEWS API into the toolkit's
++long-format ``weather_measurements.csv`` -- the input the ET stage's ``met.py``
++reads to compute ET0/E0.
++
++Suggested home: ``topkapi_setup/forcing/sources/weather_measurements.py`` -- the
++ET twin of :mod:`ethekwini_fews` (which does the same job for rain).  Its input
++is the manifest :mod:`weather_manifest` writes; its output is the long file the
++ET met reader consumes.
++
++The API returns one station's record over a date window::
++
++    GET https://data.ethekwinifews.durban/api/v1/stations/{station}/{start}/{end}
++        Accept: application/json
++        Authorization: Bearer <key>     # from $ETHEKWINI_FEWS_KEY, not the URL
++
++with dates as ``YYYY-MM-DD`` (dashed -- note this differs from the rain feed's
++``YYYYMMDD``).  ``{station}`` is the manifest ``station_id``.
++
++Response envelope (confirmed against a real payload)
++----------------------------------------------------
++Unlike the rain feed (a bare list), weather is **wrapped**::
++
++    {
++      "response": {
++        "station": "457",
++        "startDate": "2024-01-01",
++        "endDate":   "2024-01-02",
++        "data": { "weather": [ ...readings... ] }
++      }
++    }
++
++``response.data.weather`` is the list of per-reading dicts.  An **empty list
++means no data for that window** -- the common case for a station that was
++offline or predates its own record -- and is handled quietly: the station is
++skipped and flagged in the run report, never raised.  :func:`parse_response`
++returns an empty long frame for it.
++
++The fields *inside* a populated reading -- CONFIRM
++--------------------------------------------------
++The sample payload available at build time is empty, so the reading dict's field
++names are **not yet confirmed**.  :data:`VARIABLE_MAP` maps the raw field names
++this feed is expected to use onto the toolkit's canonical ET variables; it is
++generous with aliases but must be pinned against a populated payload.  Run::
++
++    python -m topkapi_setup.forcing.sources.weather_measurements \\
++        --discover --station 457 --start 2025-01-01 --end 2025-01-02
++
++to print the raw keys one real reading carries, then adjust :data:`VARIABLE_MAP`
++(one line per field).  Unmapped keys are ignored, so an unpinned map yields a
++short file rather than a wrong one.
++
++Canonical variables emitted (long ``variable`` column): ``temp`` (instantaneous
++air temperature -- the ET ``met`` stage derives the daily ``tmax``/``tmin``/
++``tmean`` from it), ``rh``, ``tdew``, ``wind``, ``solar``, ``sunshine``.  Daily
++``tmax``/``tmin``/``tmean`` are also passed straight through if the feed happens
++to report them.  This collector does **no** ET aggregation -- it faithfully
++lands the sub-daily observations; daily reduction and gap handling are the ET
++``met`` stage's job (M3 ET note), exactly as the rain/solver split keeps demand
++and loss apart.
++
++Auth, rate limits, cache, timezone
++----------------------------------
++Identical policy to the rain adapter: ``Authorization: Bearer <key>``; requests
++paced ``min_interval`` apart; ``429``/``5xx`` retried with exponential backoff
++honouring ``Retry-After``; ``--cache-dir`` snapshots each window's raw JSON so
++an interrupted run resumes.  Stamps are emitted naive as the feed renders them;
++set the timezone once on the ET ``Timeline`` (the same CONFIRM-tz note as rain).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++from email.utils import parsedate_to_datetime
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import requests
++
++__all__ = [
++    "BASE_URL",
++    "API_KEY_ENV",
++    "DATE_FMT",
++    "MEASUREMENT_COLUMNS",
++    "VARIABLE_MAP",
++    "TIME_KEYS",
++    "month_windows",
++    "fetch_station",
++    "parse_response",
++    "fetch_measurements",
++    "write_measurements",
++]
++
++BASE_URL = "https://data.ethekwinifews.durban/api/v1/stations/{station}/{start}/{end}"
++API_KEY_ENV = "ETHEKWINI_FEWS_KEY"
++
++#: This feed dates the URL as YYYY-MM-DD (dashed), unlike the rain feed.
++DATE_FMT = "%Y-%m-%d"
++
++#: The long file's columns.  Note the extra `variable` column vs rain -- one
++#: station reports several weather variables, so the file is long in variable
++#: as well as in time (ET note, "Data the user provides").
++MEASUREMENT_COLUMNS = ("datetime", "station_id", "variable", "value")
++
++#: Raw reading-field name (lower-cased) -> canonical ET variable.  UNCONFIRMED
++#: (see module docstring): pin against a populated payload with --discover.
++VARIABLE_MAP = {
++    # instantaneous air temperature (met.py reduces to daily tmax/tmin/tmean)
++    "temp": "temp", "temperature": "temp", "airtemp": "temp",
++    "air_temp": "temp", "temp_c": "temp", "t": "temp",
++    # daily temperature aggregates, if the feed ever reports them directly
++    "tmax": "tmax", "tmin": "tmin", "tmean": "tmean",
++    # humidity
++    "rh": "rh", "humidity": "rh", "relhumidity": "rh",
++    "relative_humidity": "rh", "humid": "rh",
++    "dewpoint": "tdew", "dew_point": "tdew", "tdew": "tdew",
++    # wind (speed at whatever height; met.py adjusts to 2 m)
++    "wind": "wind", "windspeed": "wind", "wind_speed": "wind",
++    "ws": "wind", "wind_spd": "wind",
++    # radiation / sunshine
++    "solar": "solar", "solarradiation": "solar", "solar_radiation": "solar",
++    "radiation": "solar", "srad": "solar", "rs": "solar",
++    "sunshine": "sunshine", "sun_hours": "sunshine",
++}
++
++#: Candidate timestamp keys, tried in order.  `tstr` is the rain feed's naive
++#: wall-clock; `time` is epoch seconds (UTC).
++TIME_KEYS = ("tstr", "datetime", "date", "time")
++
++#: Auth and rate-limit defaults (mirrors the rain adapter).
++DEFAULT_AUTH_SCHEME = "bearer"
++DEFAULT_MIN_INTERVAL = 1.0
++DEFAULT_RETRIES = 5
++DEFAULT_BACKOFF = 2.0
++_RETRYABLE = frozenset({429, 500, 502, 503, 504})
++
++
++# ---------------------------------------------------------------------------
++# Date windows
++# ---------------------------------------------------------------------------
++
++def month_windows(start, end, fmt=DATE_FMT):
++    """Split inclusive ``[start, end]`` into calendar-month ``(start, end)``
++    pairs formatted with ``fmt`` (dashed ``YYYY-MM-DD`` for this feed).
++
++    Calendar months bound each response and give stable cache filenames, so a
++    re-run skips windows already on disk.
++    """
++    start = pd.Timestamp(start).normalize()
++    end = pd.Timestamp(end).normalize()
++    if end < start:
++        raise ValueError(f"end {end.date()} precedes start {start.date()}")
++    windows = []
++    for month in pd.period_range(start, end, freq="M"):
++        w0 = max(start, month.start_time.normalize())
++        w1 = min(end, month.end_time.normalize())
++        windows.append((w0.strftime(fmt), w1.strftime(fmt)))
++    return windows
++
++
++# ---------------------------------------------------------------------------
++# HTTP (self-contained; same policy as the rain adapter)
++# ---------------------------------------------------------------------------
++
++def _auth_header(scheme, key):
++    scheme = (scheme or "raw").lower()
++    if scheme == "raw":
++        return key
++    if scheme == "bearer":
++        return f"Bearer {key}"
++    if scheme == "token":
++        return f"Token {key}"
++    raise ValueError(f"unknown auth_scheme {scheme!r}; use raw, bearer or token")
++
++
++def _retry_after(resp):
++    if resp is None:
++        return None
++    value = resp.headers.get("Retry-After")
++    if not value:
++        return None
++    try:
++        return float(value)
++    except ValueError:
++        try:
++            when = parsedate_to_datetime(value)
++            import datetime as _dt
++            return max(0.0, (when - _dt.datetime.now(when.tzinfo)).total_seconds())
++        except Exception:
++            return None
++
++
++def _pace(session, min_interval):
++    if not min_interval or min_interval <= 0:
++        return
++    now = time.monotonic()
++    nxt = getattr(session, "_efews_next", 0.0)
++    if now < nxt:
++        time.sleep(nxt - now)
++        now = time.monotonic()
++    session._efews_next = now + min_interval
++
++
++def fetch_station(station, start, end, *, session=None, api_key=None,
++                  cache_dir=None, timeout=60, retries=DEFAULT_RETRIES,
++                  backoff=DEFAULT_BACKOFF, auth_scheme=DEFAULT_AUTH_SCHEME,
++                  min_interval=DEFAULT_MIN_INTERVAL):
++    """Fetch one station's raw payload for ``[start, end]`` (both ``YYYY-MM-DD``).
++
++    A ``cache_dir`` doubles as a dated provenance snapshot: the raw JSON is
++    written as ``{station}_{start}_{end}.json`` and re-read next run.
++
++    ``429``/``5xx`` are retried with exponential backoff honouring
++    ``Retry-After``; other ``4xx`` (``401`` bad key, ``404`` unknown station)
++    fail immediately with the response body.
++    """
++    if cache_dir is not None:
++        cached = Path(cache_dir) / f"{station}_{start}_{end}.json"
++        if cached.exists():
++            return json.loads(cached.read_text())
++
++    api_key = api_key or os.environ.get(API_KEY_ENV)
++    if not api_key:
++        raise RuntimeError(
++            f"no API key: set ${API_KEY_ENV} or pass api_key=. The key goes in "
++            "the Authorization header, never in the URL."
++        )
++
++    sess = session or requests.Session()
++    url = BASE_URL.format(station=station, start=start, end=end)
++    headers = {"Accept": "application/json",
++               "Authorization": _auth_header(auth_scheme, api_key)}
++
++    last_error = None
++    for attempt in range(retries):
++        _pace(sess, min_interval)
++        try:
++            resp = sess.get(url, headers=headers, timeout=timeout)
++            resp.raise_for_status()
++            payload = resp.json()
++            break
++        except requests.HTTPError as exc:
++            r = exc.response
++            status = getattr(r, "status_code", None)
++            if status in _RETRYABLE:
++                last_error = exc
++                if attempt + 1 < retries:
++                    wait = _retry_after(r)
++                    if wait is None:
++                        wait = backoff * (2 ** attempt)
++                    time.sleep(wait)
++                    continue
++                raise RuntimeError(
++                    f"{status} for station {station} {start}-{end} after "
++                    f"{retries} attempts (rate-limited?); raise --min-interval "
++                    f"or retry later: {r.text[:200]}"
++                ) from exc
++            if status is not None and 400 <= status < 500:
++                raise RuntimeError(
++                    f"{status} for station {station} {start}-{end}: {r.text[:200]}"
++                ) from exc
++            last_error = exc
++        except requests.RequestException as exc:
++            last_error = exc
++        if attempt + 1 < retries:
++            time.sleep(backoff * (2 ** attempt))
++    else:
++        raise RuntimeError(
++            f"failed to fetch station {station} for {start}-{end}: {last_error}"
++        )
++
++    if cache_dir is not None:
++        cached.parent.mkdir(parents=True, exist_ok=True)
++        cached.write_text(json.dumps(payload))
++    return payload
++
++
++# ---------------------------------------------------------------------------
++# Unwrap the envelope and normalise one station's payload
++# ---------------------------------------------------------------------------
++
++def _weather_list(payload):
++    """Return the ``response.data.weather`` list, tolerating shape drift.
++
++    Accepts the confirmed wrapped envelope, a half-wrapped ``data.weather``, or
++    a bare list.  A missing ``weather`` key or an empty list both yield ``[]``
++    (no data) rather than an error -- an offline station is normal.
++    """
++    node = payload
++    if isinstance(node, dict) and "response" in node:
++        node = node["response"]
++    if isinstance(node, dict) and "data" in node:
++        node = node["data"]
++    if isinstance(node, dict):
++        node = node.get("weather", node.get("readings", []))
++    if node is None:
++        return []
++    if not isinstance(node, list):
++        raise ValueError(
++            f"expected response.data.weather to be a list, got "
++            f"{type(node).__name__}"
++        )
++    return node
++
++
++def _reading_time(reading, time_keys):
++    for key in time_keys:
++        if key in reading and reading[key] not in (None, ""):
++            if key == "time":                    # epoch seconds, UTC
++                return pd.to_datetime(pd.to_numeric(reading[key]),
++                                      unit="s", utc=True)
++            return pd.to_datetime(reading[key], errors="coerce")
++    return pd.NaT
++
++
++def parse_response(payload, station_id=None, *, variable_map=None,
++                   time_keys=TIME_KEYS):
++    """Normalise one station's payload to long ``DataFrame`` rows.
++
++    Columns: ``datetime, station_id, variable, value``.  Each reading dict
++    expands to one row per mapped variable present.  An empty ``weather`` list
++    (no data) returns an empty frame -- callers treat that as "skip, note it",
++    never an error.  Fields not in ``variable_map`` are ignored (discoverable
++    with ``--discover``); a reading with no parseable timestamp is dropped.
++    """
++    variable_map = VARIABLE_MAP if variable_map is None else variable_map
++    readings = _weather_list(payload)
++
++    # Fall back to the payload's own station id when the caller didn't pass one.
++    if station_id is None and isinstance(payload, dict):
++        station_id = (payload.get("response", {}) or {}).get("station")
++    station_id = None if station_id is None else str(station_id).strip()
++
++    if not readings:
++        return pd.DataFrame(columns=list(MEASUREMENT_COLUMNS))
++
++    rows = []
++    for reading in readings:
++        if not isinstance(reading, dict):
++            continue
++        stamp = _reading_time(reading, time_keys)
++        if pd.isna(stamp):
++            continue
++        for raw_key, raw_val in reading.items():
++            canon = variable_map.get(str(raw_key).strip().lower())
++            if canon is None or raw_val in (None, ""):
++                continue
++            val = pd.to_numeric(raw_val, errors="coerce")
++            if pd.isna(val):
++                continue
++            rows.append((stamp, station_id, canon, float(val)))
++
++    out = pd.DataFrame(rows, columns=list(MEASUREMENT_COLUMNS))
++    return out.dropna(subset=["datetime", "value"])
++
++
++def discover_fields(payload, sample=1):
++    """Return the set of raw field names seen across the first ``sample``
++    readings -- a helper for pinning :data:`VARIABLE_MAP` against live data.
++    """
++    readings = _weather_list(payload)
++    keys = {}
++    for reading in readings[:sample]:
++        if isinstance(reading, dict):
++            for k, v in reading.items():
++                keys.setdefault(str(k), v)
++    return keys
++
++
++# ---------------------------------------------------------------------------
++# Fetch every station into one long frame
++# ---------------------------------------------------------------------------
++
++def fetch_measurements(manifest, start, end, *, id_col="station_id",
++                       session=None, api_key=None, cache_dir=None,
++                       variable_map=None, time_keys=TIME_KEYS,
++                       auth_scheme=DEFAULT_AUTH_SCHEME,
++                       min_interval=DEFAULT_MIN_INTERVAL,
++                       retries=DEFAULT_RETRIES, timeout=60):
++    """Fetch every station in the manifest into one long measurements frame.
++
++    Parameters
++    ----------
++    manifest : DataFrame or path
++        Must carry ``id_col`` (default ``station_id``) -- the weather manifest
++        from :mod:`weather_manifest`.
++    start, end : str or Timestamp
++        Inclusive date bounds; ``YYYY-MM-DD`` or Timestamps.
++
++    Returns
++    -------
++    measurements : DataFrame
++        Long ``datetime, station_id, variable, value``, sorted.
++    report : DataFrame
++        Per-station reading count, distinct variables seen, and a note --
++        ``"no data"`` where the feed returned an empty ``weather`` list.
++    """
++    if not isinstance(manifest, pd.DataFrame):
++        manifest = pd.read_csv(manifest)
++    if id_col not in manifest.columns:
++        raise ValueError(
++            f"manifest is missing '{id_col}'; columns present: "
++            f"{list(manifest.columns)}"
++        )
++
++    windows = month_windows(start, end)
++    sess = session or requests.Session()
++    frames, report = [], []
++
++    for _, row in manifest.iterrows():
++        sid = str(row[id_col]).strip()
++        if not sid or sid.lower() == "nan":
++            report.append((sid, 0, "", "no station id"))
++            continue
++
++        per_window = []
++        for w0, w1 in windows:
++            payload = fetch_station(
++                sid, w0, w1, session=sess, api_key=api_key,
++                cache_dir=cache_dir, auth_scheme=auth_scheme,
++                min_interval=min_interval, retries=retries, timeout=timeout)
++            per_window.append(parse_response(
++                payload, station_id=sid, variable_map=variable_map,
++                time_keys=time_keys))
++
++        one = (pd.concat(per_window, ignore_index=True) if per_window
++               else pd.DataFrame(columns=list(MEASUREMENT_COLUMNS)))
++        if len(one):
++            one = one.sort_values(["datetime", "variable"], ignore_index=True)
++            frames.append(one)
++            variables = ", ".join(sorted(one["variable"].unique()))
++            report.append((sid, len(one), variables, ""))
++        else:
++            report.append((sid, 0, "", "no data"))
++
++    measurements = (pd.concat(frames, ignore_index=True) if frames
++                    else pd.DataFrame(columns=list(MEASUREMENT_COLUMNS)))
++    if len(measurements):
++        measurements = measurements.sort_values(
++            ["station_id", "datetime", "variable"], ignore_index=True)
++    report = pd.DataFrame(
++        report, columns=["station_id", "n_readings", "variables", "note"])
++    return measurements, report
++
++
++def write_measurements(measurements, path):
++    """Write the long frame to CSV in the layout the ET met reader reads."""
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    measurements.to_csv(path, index=False)
++    return str(path)
++
++
++# ---------------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------------
++
++def _cli(argv=None):
++    import argparse
++
++    p = argparse.ArgumentParser(
++        description="Fetch eThekwini FEWS weather observations into a toolkit "
++                    "weather_measurements.csv (input for the ET stage).",
++    )
++    p.add_argument("--manifest",
++                   help="weather manifest (needs a station_id column)")
++    p.add_argument("--start", required=True, help="YYYY-MM-DD")
++    p.add_argument("--end", required=True, help="YYYY-MM-DD")
++    p.add_argument("--out", help="output weather_measurements.csv")
++    p.add_argument("--id-col", default="station_id")
++    p.add_argument("--cache-dir", default=None,
++                   help="cache/provenance dir for raw JSON per window")
++    p.add_argument("--auth-scheme", default=DEFAULT_AUTH_SCHEME,
++                   choices=["bearer", "raw", "token"],
++                   help="Authorization header scheme (default bearer)")
++    p.add_argument("--min-interval", type=float, default=DEFAULT_MIN_INTERVAL,
++                   help="seconds between requests, to respect rate limits "
++                        f"(default {DEFAULT_MIN_INTERVAL:g})")
++    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
++                   help=f"retry budget per window (default {DEFAULT_RETRIES})")
++    p.add_argument("--discover", action="store_true",
++                   help="print the raw field names one station's first reading "
++                        "carries (to pin VARIABLE_MAP), then exit")
++    p.add_argument("--station", help="station id for --discover")
++    args = p.parse_args(argv)
++
++    if args.discover:
++        station = args.station
++        if not station:
++            p.error("--discover needs --station")
++        payload = fetch_station(
++            station, pd.Timestamp(args.start).strftime(DATE_FMT),
++            pd.Timestamp(args.end).strftime(DATE_FMT),
++            auth_scheme=args.auth_scheme, min_interval=args.min_interval,
++            retries=args.retries, cache_dir=args.cache_dir)
++        fields = discover_fields(payload)
++        if not fields:
++            print(f"station {station}: no readings in {args.start}..{args.end} "
++                  "(empty weather list) -- try a wetter/warmer window")
++            return
++        print(f"station {station}: raw fields in first reading -> canonical")
++        for k, v in fields.items():
++            canon = VARIABLE_MAP.get(k.strip().lower(), "(unmapped)")
++            print(f"  {k!r:24} e.g. {v!r:>12}   -> {canon}")
++        return
++
++    if not args.manifest or not args.out:
++        p.error("--manifest and --out are required unless --discover")
++
++    measurements, report = fetch_measurements(
++        args.manifest, args.start, args.end, id_col=args.id_col,
++        cache_dir=args.cache_dir, auth_scheme=args.auth_scheme,
++        min_interval=args.min_interval, retries=args.retries,
++    )
++    write_measurements(measurements, args.out)
++    print(report.to_string(index=False))
++    n_stations = int((report["n_readings"] > 0).sum())
++    print(f"\n{len(measurements)} readings, {n_stations} stations with data "
++          f"-> {args.out}")
++
++
++if __name__ == "__main__":
++    _cli()
+diff --git a/topkapi_setup/tests/test_weather_sources.py b/topkapi_setup/tests/test_weather_sources.py
+new file mode 100644
+index 0000000..e3a357e
+--- /dev/null
++++ b/topkapi_setup/tests/test_weather_sources.py
+@@ -0,0 +1,312 @@
++"""Tests for the eThekwini weather source pair:
++
++* ``forcing/sources/weather_manifest.py``    -- /stations -> weather_manifest.csv
++* ``forcing/sources/weather_measurements.py``-- observations -> weather_measurements.csv
++
++Network is never touched: a fake ``requests.Session`` returns canned payloads,
++including the two real sample payloads (the station dump and the empty-window
++envelope) the API was observed to return.
++"""
++
++import json
++
++import numpy as np
++import pandas as pd
++import pytest
++import rasterio
++from rasterio.transform import from_origin
++
++from topkapi_setup.forcing.sources import weather_manifest as wm
++from topkapi_setup.forcing.sources import weather_measurements as wmeas
++
++
++# --------------------------------------------------------------------------
++# Fixtures: the real station dump, a mask + DEM around the Ohlanga
++# --------------------------------------------------------------------------
++
++# The station list exactly as the /stations endpoint returned it.
++STATION_DUMP = [
++    {"id": "457", "name": "uShaka WX", "devices": {"weather": "PTM5360"},
++     "latitude": "-29.868318", "longitude": "31.044269", "reference": ""},
++    {"id": "3393", "name": "Fairway WX", "devices": {"weather": "PTM5311"},
++     "latitude": "-29.8211", "longitude": "31.0962", "reference": ""},
++    {"id": "6444", "name": "Alverstone WX", "devices": {"weather": "PTM6059"},
++     "latitude": "-29.76085", "longitude": "30.72265", "reference": ""},
++    {"id": "6445", "name": "Ballito WWTW WX", "devices": {"weather": "PTM6062"},
++     "latitude": "-29.540115", "longitude": "31.193543", "reference": ""},
++    {"id": "6446", "name": "Buffelsdraai Landfill WX",
++     "devices": {"weather": "PTM5020"},
++     "latitude": "-29.63105", "longitude": "30.98315", "reference": ""},
++    {"id": "6447", "name": "City Eng Dept WX", "devices": {"weather": "PTM6063"},
++     "latitude": "-29.85125", "longitude": "31.02365", "reference": ""},
++    {"id": "6448", "name": "Durban North WX", "devices": {"weather": "PTM6078"},
++     "latitude": "-29.77665", "longitude": "31.04725", "reference": ""},
++    {"id": "6450", "name": "Illovo Landfill WX", "devices": {"weather": "PTM5005"},
++     "latitude": "-30.11515", "longitude": "30.81245", "reference": ""},
++    {"id": "6451", "name": "Port Shepstone WX", "devices": {"weather": "PTM6064"},
++     "latitude": "-30.798277", "longitude": "30.418614", "reference": ""},
++    {"id": "6452", "name": "Riverlea WX", "devices": {"weather": "PTM6689"},
++     "latitude": "-29.88065", "longitude": "30.29505", "reference": ""},
++    {"id": "6453", "name": "UKZN WX", "devices": {"weather": "PTM6060"},
++     "latitude": "-29.87115", "longitude": "30.97625", "reference": ""},
++    # weather-less placeholders -- must be dropped
++    {"id": "205", "name": "UMHLANGA BEACH", "devices": {"weather": ""},
++     "latitude": "-29.7267", "longitude": "31.08839", "reference": ""},
++    {"id": "4123", "name": "DBN Point Weather ",
++     "devices": {"weather": "", "rain": ""},
++     "latitude": "-29.872903", "longitude": "31.050076", "reference": ""},
++    {"id": "6449", "name": "Point - Pump Station [WX]", "devices": {"weather": ""},
++     "latitude": "-29.87281", "longitude": "31.050182", "reference": ""},
++]
++
++OUTLET = (316235.0, 6712472.0)   # Ohlanga mouth, UTM36S (project memory)
++
++
++@pytest.fixture
++def mask_path(tmp_path):
++    """A small all-in-mask block around the Ohlanga outlet, EPSG:32736."""
++    res, n = 200.0, 30
++    x0, y0 = OUTLET[0] - 3000.0, OUTLET[1] + 3000.0     # top-left
++    transform = from_origin(x0, y0, res, res)
++    band = np.ones((n, n), dtype="uint8")
++    p = tmp_path / "mask.tif"
++    with rasterio.open(
++            p, "w", driver="GTiff", height=n, width=n, count=1,
++            dtype="uint8", transform=transform,
++            crs=rasterio.crs.CRS.from_epsg(32736), nodata=0) as ds:
++        ds.write(band, 1)
++    return str(p)
++
++
++@pytest.fixture
++def dem_path(tmp_path):
++    """A coarse DEM covering the near-station cluster, EPSG:32736.
++
++    Spans E 300000..320000, N 6690000..6725000 -- wide enough to give every
++    in-buffer station a real elevation.  Elevation ramps gently inland.
++    """
++    res = 250.0
++    x0, y0 = 300000.0, 6725000.0
++    ncols, nrows = int(20000 / res), int(35000 / res)
++    cols = np.arange(ncols)[None, :]
++    dem = (5.0 + 0.01 * res * cols).astype("float64")   # rises to the east
++    dem = np.broadcast_to(dem, (nrows, ncols)).copy()
++    p = tmp_path / "dem.tif"
++    with rasterio.open(
++            p, "w", driver="GTiff", height=nrows, width=ncols, count=1,
++            dtype="float64", transform=from_origin(x0, y0, res, res),
++            crs=rasterio.crs.CRS.from_epsg(32736), nodata=-9999.0) as ds:
++        ds.write(dem, 1)
++    return str(p)
++
++
++# --------------------------------------------------------------------------
++# Fake HTTP
++# --------------------------------------------------------------------------
++
++class FakeResp:
++    def __init__(self, payload, status=200, headers=None):
++        self._payload = payload
++        self.status_code = status
++        self.headers = headers or {}
++        self.text = json.dumps(payload) if isinstance(payload, (dict, list)) else str(payload)
++
++    def raise_for_status(self):
++        if self.status_code >= 400:
++            import requests
++            raise requests.HTTPError(response=self)
++
++    def json(self):
++        return self._payload
++
++
++class FakeSession:
++    """Routes by URL substring; records the headers it was called with."""
++    def __init__(self, routes):
++        self.routes = routes            # list of (substr, payload_or_resp)
++        self.calls = []
++
++    def get(self, url, headers=None, timeout=None):
++        self.calls.append((url, headers))
++        for substr, payload in self.routes:
++            if substr in url:
++                return payload if isinstance(payload, FakeResp) else FakeResp(payload)
++        raise AssertionError(f"no fake route for {url}")
++
++
++# --------------------------------------------------------------------------
++# parse_ethekwini_weather
++# --------------------------------------------------------------------------
++
++def test_parse_keeps_weather_stations_drops_placeholders():
++    df = wm.parse_ethekwini_weather(STATION_DUMP)
++    ids = set(df["station_id"])
++    assert "457" in ids and "6453" in ids            # real weather stations
++    assert {"205", "4123", "6449"}.isdisjoint(ids)   # weather-less placeholders
++    assert len(df) == 11
++    # " WX" trimmed from the display name; device serial carried.
++    ushaka = df.set_index("station_id").loc["457"]
++    assert ushaka["name"] == "uShaka"
++    assert ushaka["device"] == "PTM5360"
++
++
++def test_parse_accepts_literal_string_and_flags_duplicates():
++    # single-quoted Python literal, as the dump sometimes arrives
++    literal = repr(STATION_DUMP[:2])
++    assert len(wm.parse_ethekwini_weather(literal)) == 2
++
++    dup = STATION_DUMP[:1] + STATION_DUMP[:1]
++    with pytest.raises(ValueError, match="duplicate station_id"):
++        wm.parse_ethekwini_weather(dup)
++
++
++# --------------------------------------------------------------------------
++# build_manifest: scoping, columns, elevation
++# --------------------------------------------------------------------------
++
++def test_build_manifest_scopes_and_fills_elevation(mask_path, dem_path):
++    manifest = wm.build_manifest(
++        STATION_DUMP, mask_path, dem_path=dem_path, buffer_m=15_000)
++
++    assert list(manifest.columns) == list(wm.MANIFEST_COLUMNS)
++    ids = set(manifest["station_id"])
++    # clearly inside 15 km of the outlet
++    assert {"6448", "3393"} <= ids
++    # clearly outside
++    assert {"6450", "6451", "6452", "6444"}.isdisjoint(ids)
++
++    # coordinates reprojected into the mask CRS (UTM36S, metric)
++    assert str(manifest["crs"].iloc[0]).upper().endswith("32736")
++    assert manifest["x"].between(280_000, 340_000).all()
++
++    # elevation sampled from the DEM -> finite for every kept station
++    assert np.isfinite(manifest["elevation_m"].to_numpy()).all()
++    assert manifest["in_mask"].dtype == bool
++
++
++def test_build_manifest_without_dem_warns_and_leaves_elevation_nan(mask_path):
++    with pytest.warns(UserWarning, match="Penman"):
++        manifest = wm.build_manifest(
++            STATION_DUMP, mask_path, dem_path=None, buffer_m=15_000)
++    assert manifest["elevation_m"].isna().all()
++
++
++def test_build_manifest_fetches_live_when_network_none(mask_path, dem_path):
++    sess = FakeSession([("/stations", STATION_DUMP)])
++    manifest = wm.build_manifest(
++        None, mask_path, dem_path=dem_path, buffer_m=15_000,
++        api_key="secret", session=sess)
++    assert len(manifest) >= 2
++    # bearer token carried in the header, never the URL
++    url, headers = sess.calls[0]
++    assert headers["Authorization"] == "Bearer secret"
++    assert "secret" not in url
++
++
++def test_manifest_writes_csv_and_sorts_in_mask_first(mask_path, dem_path, tmp_path):
++    out = tmp_path / "weather_manifest.csv"
++    manifest = wm.build_manifest(
++        STATION_DUMP, mask_path, out, dem_path=dem_path, buffer_m=30_000)
++    reread = pd.read_csv(out)
++    assert list(reread.columns) == list(wm.MANIFEST_COLUMNS)
++    # sorted so in_mask stations lead
++    assert manifest["in_mask"].to_numpy().tolist() == \
++        sorted(manifest["in_mask"].to_numpy().tolist(), reverse=True)
++
++
++# --------------------------------------------------------------------------
++# measurements: the real empty envelope, and a synthetic populated one
++# --------------------------------------------------------------------------
++
++# Real payload for an empty window (station 457, 2024-01-01..02).
++EMPTY_PAYLOAD = {
++    "response": {"station": "457", "startDate": "2024-01-01",
++                 "endDate": "2024-01-02", "data": {"weather": []}},
++}
++
++# SYNTHETIC populated payload -- field names are illustrative (unconfirmed),
++# used only to exercise the long-format expansion and the variable map.
++def _populated_payload(station="3393"):
++    readings = [
++        {"tstr": "2025-01-01 06:00:00", "temp": "19.4", "humidity": "88",
++         "wind": "1.2", "solar": "40", "battery": "12.6"},   # battery unmapped
++        {"tstr": "2025-01-01 12:00:00", "temp": "27.1", "humidity": "61",
++         "wind": "3.4", "solar": "820"},
++    ]
++    return {"response": {"station": station, "startDate": "2025-01-01",
++                         "endDate": "2025-01-31", "data": {"weather": readings}}}
++
++
++def test_parse_empty_window_returns_empty_frame():
++    out = wmeas.parse_response(EMPTY_PAYLOAD)
++    assert out.empty
++    assert list(out.columns) == list(wmeas.MEASUREMENT_COLUMNS)
++
++
++def test_parse_populated_expands_to_long_and_ignores_unmapped():
++    out = wmeas.parse_response(_populated_payload(), station_id="3393")
++    assert list(out.columns) == list(wmeas.MEASUREMENT_COLUMNS)
++    # two readings x four mapped vars (temp, rh, wind, solar) = 8 rows
++    assert len(out) == 8
++    assert set(out["variable"]) == {"temp", "rh", "wind", "solar"}
++    assert "battery" not in set(out["variable"])          # unmapped -> ignored
++    # values numeric, station id stamped, midday temp present
++    midday = out[(out["variable"] == "temp") &
++                 (out["datetime"] == pd.Timestamp("2025-01-01 12:00:00"))]
++    assert float(midday["value"].iloc[0]) == pytest.approx(27.1)
++    assert (out["station_id"] == "3393").all()
++
++
++def test_discover_fields_lists_raw_keys():
++    fields = wmeas.discover_fields(_populated_payload())
++    assert "battery" in fields and "temp" in fields
++
++
++def test_month_windows_are_dashed_and_calendar_split():
++    w = wmeas.month_windows("2025-01-15", "2025-02-10")
++    assert w == [("2025-01-15", "2025-01-31"), ("2025-02-01", "2025-02-10")]
++
++
++def test_fetch_station_sends_bearer_and_dashed_dates(tmp_path):
++    sess = FakeSession([("/stations/3393/", _populated_payload())])
++    payload = wmeas.fetch_station(
++        "3393", "2025-01-01", "2025-01-31", session=sess, api_key="secret",
++        min_interval=0)
++    url, headers = sess.calls[0]
++    assert headers["Authorization"] == "Bearer secret"
++    assert "/3393/2025-01-01/2025-01-31" in url
++    assert payload["response"]["station"] == "3393"
++
++
++def test_fetch_measurements_reports_no_data_and_collects(tmp_path):
++    manifest = pd.DataFrame({"station_id": ["457", "3393"]})
++    sess = FakeSession([
++        ("/stations/457/", EMPTY_PAYLOAD),          # offline -> no data
++        ("/stations/3393/", _populated_payload()),  # has data
++    ])
++    meas, report = wmeas.fetch_measurements(
++        manifest, "2025-01-01", "2025-01-31", session=sess, api_key="secret",
++        min_interval=0)
++
++    r = report.set_index("station_id")
++    assert r.loc["457", "note"] == "no data"
++    assert r.loc["457", "n_readings"] == 0
++    assert r.loc["3393", "n_readings"] == 8
++    assert "temp" in r.loc["3393", "variables"]
++
++    # only the station with data lands rows; sorted, long format
++    assert set(meas["station_id"]) == {"3393"}
++    assert meas["datetime"].is_monotonic_increasing
++
++
++def test_fetch_station_caches_raw_json(tmp_path):
++    cache = tmp_path / "cache"
++    sess = FakeSession([("/stations/457/", EMPTY_PAYLOAD)])
++    wmeas.fetch_station("457", "2025-01-01", "2025-01-31", session=sess,
++                        api_key="secret", cache_dir=str(cache), min_interval=0)
++    snap = cache / "457_2025-01-01_2025-01-31.json"
++    assert snap.exists()
++    # second call served from disk -> no new HTTP hit
++    wmeas.fetch_station("457", "2025-01-01", "2025-01-31", session=sess,
++                        api_key="secret", cache_dir=str(cache), min_interval=0)
++    assert len(sess.calls) == 1
