@@ -395,3 +395,109 @@ def reference_et0(row, latitude, measured_wind_height=2.0):
 
     et0 = et0_hargreaves(tmax, tmin, doy, latitude, tmean=tmean)
     return float(et0), "hargreaves"
+
+
+# ---------------------------------------------------------------------------
+# CLI -- daily ET0/E0 per station from a met daily table
+# ---------------------------------------------------------------------------
+
+def et0_eto_frame(daily, manifest, *, wind_height=2.0, method="auto"):
+    """Compute daily ``et0`` (ETr) and ``eto`` (E0 open water) per station-day.
+
+    ``daily`` is the :func:`met.daily_table` output (a DataFrame or its CSV path);
+    ``manifest`` is the weather manifest (DataFrame or path) -- it supplies each
+    station's ``elevation_m`` and, via its coordinates, latitude.  ``eto`` is the
+    open-water Penman evaporation where the full energy balance is available and
+    falls back to ``eto = et0`` otherwise (the design-note channel-evaporation
+    shortcut).  Returns a frame ``station_id, date, et0, eto, method``.
+    """
+    from pyproj import Transformer
+    from . import met as _met
+
+    if not isinstance(daily, pd.DataFrame):
+        daily = pd.read_csv(daily, parse_dates=["date"])
+    daily = daily.copy()
+    daily["station_id"] = daily["station_id"].astype(str).str.strip()
+
+    man = manifest if isinstance(manifest, pd.DataFrame) else _met.read_manifest(manifest)
+    # latitude (degrees) per station: reproject the model-CRS coordinates back
+    # to lon/lat, so it is correct whatever CRS the manifest declared.
+    tx = Transformer.from_crs(str(man["crs"].iloc[0]), "EPSG:4326", always_xy=True)
+    _, lat = tx.transform(man["x"].to_numpy(float), man["y"].to_numpy(float))
+    lat_of = dict(zip(man.index, lat))
+    elev_of = man["elevation_m"].to_dict()
+
+    rows = []
+    for rec in daily.to_dict("records"):
+        sid = rec["station_id"]
+        if sid not in lat_of:
+            continue
+        rec["elevation_m"] = elev_of.get(sid, np.nan)
+        latitude = lat_of[sid]
+
+        forced_harg = method == "hargreaves"
+        et0, used = reference_et0(rec, latitude, measured_wind_height=wind_height)
+        if forced_harg and not pd.isna(rec.get("tmax")) and not pd.isna(rec.get("tmin")):
+            doy = day_of_year(rec["date"])[0]
+            et0 = float(et0_hargreaves(rec["tmax"], rec["tmin"], doy, latitude,
+                                       tmean=rec.get("tmean")))
+            used = "hargreaves"
+
+        # open-water ETo: full Penman where energy + humidity exist, else = ETr
+        eto = et0
+        if used == "penman_monteith":
+            ea = (ea_from_tdew(rec["tdew"]) if not pd.isna(rec.get("tdew"))
+                  else ea_from_rhmean(rec["rh"], rec["tmax"], rec["tmin"]))
+            eto = float(e0_open_water(
+                rec["tmax"], rec["tmin"], rs_from_wm2(rec["solar"]),
+                wind_speed_2m(rec["wind"], wind_height), ea,
+                rec["elevation_m"], latitude, day_of_year(rec["date"])[0],
+                tmean=rec.get("tmean")))
+
+        rows.append({"station_id": sid, "date": rec["date"],
+                     "et0": et0, "eto": eto, "method": used})
+
+    return pd.DataFrame(rows, columns=["station_id", "date", "et0", "eto", "method"])
+
+
+def _cli(argv=None):
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Daily reference ET0 (ETr) and open-water E0 (ETo) per "
+                    "station from a `met` daily table.",
+    )
+    p.add_argument("--daily", required=True,
+                   help="weather_daily.csv from `met` (station_id, date, tmax, …)")
+    p.add_argument("--manifest", required=True,
+                   help="weather_manifest.csv (elevation_m + coordinates)")
+    p.add_argument("--out", default=None, help="write per-station-day ET0/ETo CSV")
+    p.add_argument("--wind-height", type=float, default=2.0,
+                   help="anemometer height (m) for the 2 m adjustment "
+                        "(default 2.0; set 10 for a typical AWS once confirmed)")
+    p.add_argument("--method", choices=["auto", "hargreaves"], default="auto",
+                   help="'auto' uses Penman-Monteith where radiation+humidity "
+                        "allow, else Hargreaves; 'hargreaves' forces the "
+                        "temperature-only method everywhere")
+    args = p.parse_args(argv)
+
+    out = et0_eto_frame(args.daily, args.manifest,
+                        wind_height=args.wind_height, method=args.method)
+    good = out[out["et0"].notna()]
+
+    print("=== method used (station-days) ===")
+    print(out["method"].value_counts().to_string())
+    print("\n=== ET0 (mm/day) per station ===")
+    summ = (good.groupby("station_id")["et0"]
+            .agg(["count", "min", "mean", "max"]).round(2))
+    print(summ.to_string())
+    print("\n=== head ===")
+    print(out.head(10).to_string(index=False))
+
+    if args.out:
+        out.to_csv(args.out, index=False)
+        print(f"\n{len(out)} station-days -> {args.out}")
+
+
+if __name__ == "__main__":
+    _cli()

@@ -1,0 +1,497 @@
+diff --git a/topkapi_setup/USAGE.md b/topkapi_setup/USAGE.md
+index 155cc2f..30733fe 100644
+--- a/topkapi_setup/USAGE.md
++++ b/topkapi_setup/USAGE.md
+@@ -10,7 +10,8 @@ raw DEM ──preflight──▶ clean UTM36S DEM ──terrain──▶ mask/fl
+                                                           │
+                                               params ◀────┤ (snaps to the mask)
+                                                           │
+-                                             forcing ◀────┘ (same cell order)
++                              rainfall (§4) ◀─────────────┤ (same cell order)
++                                    ET (§5) ◀─────────────┘
+                                                           │
+                                               (M4) config + run …
+ ```
+@@ -360,8 +361,6 @@ gauges_raw.json ──gauge_manifest──▶ manifest.csv ──ethekwini_fews
+ station to the mask's CRS, keeps those within a buffer of the delineated
+ catchment, and writes the manifest.
+ 
+-these are for rain gauges
+-
+ ```bash
+ python -m topkapi_setup.forcing.sources.gauge_manifest \
+     --network projects/umhlanga/raw/gauges_raw.json \
+@@ -462,153 +461,6 @@ Ragged records and gaps cost nothing in this shape. A blank `rainfall_mm` is a
+ **gap**, not a dry reading, and is carried as such; a negative value is rejected
+ outright, since it is almost always a `-9999` no-data sentinel.
+ 
+-### Sourcing weather stations from eThekwini FEWS (ET forcing)
+-
+-The ET stage needs a weather manifest and a long measurements file, the ET twins
+-of the rainfall pair in 4.1. Two adapters under `topkapi_setup/forcing/sources/`
+-build them from the same eThekwini FEWS network. Both are thin CLIs; run them in
+-order.
+-
+-/stations ──weather_manifest──▶ weather_manifest.csv ──weather_measurements──▶ weather_measurements.csv
+-
+-
+-**Scope the network to the catchment — `weather_manifest`.** Fetches the live
+-station list (or reads a saved dump), keeps stations that carry a `weather`
+-device and fall within a buffer of the catchment, samples each station's
+-elevation from the DEM, and writes the manifest.
+-
+-```bash
+-export ETHEKWINI_FEWS_KEY=…            # Authorization header, never the URL
+-python -m topkapi_setup.forcing.sources.weather_manifest \
+-    --mask projects/umhlanga/terrain/mask.tif \
+-    --dem  projects/umhlanga/terrain/dem_utm36s.tif \
+-    --out  projects/umhlanga/forcing/weather_manifest.csv \
+-    --buffer-km 20
+-```
+-
+-`--network` is optional: omit it to fetch `/api/v1/stations` live, or pass a
+-saved dump (Python-literal or strict JSON, both parse). `--mask` is the
+-`terrain.py` mask and must be projected in metres — the buffer distance and the
+-output coordinates are metres in its CRS. Only stations with a non-empty
+-`devices.weather` are kept; the weather-less placeholders in the dump are
+-dropped. The output follows the ET manifest contract
+-(`station_id, x, y, crs, elevation_m, name, source`) plus two carried columns:
+-`device` (instrument serial, provenance only) and `in_mask`.
+-
+-**`--dem` is not optional for Penman–Monteith.** The API carries no elevation,
+-but FAO-56 needs it (air pressure, hence γ, hence ET₀, depends on station
+-height), so the manifest samples the terrain DEM. A far buffer station off the
+-DEM footprint is left `elevation_m` blank with a warning rather than given a fake
+-height — the ET stage can fall back to temperature-only Hargreaves there. Omit
+-`--dem` entirely and every elevation is blank (a Hargreaves-only run).
+-
+-Keep the buffer. A station just outside the divide still constrains the ET field
+-at the edge; `in_mask` records which stations are strictly inside. ET₀ varies
+-smoothly, so a couple of stations is ample — for the Ohlanga, one broadcast
+-uniformly is reasonable.
+-
+-**Pull the series — `weather_measurements`.** Fetches each station in the
+-manifest over a date window and writes the long `weather_measurements.csv`.
+-
+-```bash
+-python -m topkapi_setup.forcing.sources.weather_measurements \
+-    --manifest  projects/umhlanga/forcing/weather_manifest.csv \
+-    --start 20250101 --end 20250131 \
+-    --out       projects/umhlanga/forcing/weather_measurements.csv \
+-    --cache-dir projects/umhlanga/raw/weather
+-```
+-
+-| Flag | Default | Purpose |
+-|---|---|---|
+-| `--cache-dir` | none | raw JSON per station-window; provenance, and resumes a run |
+-| `--min-interval` | `1.0` | seconds between requests; raise it if `429` persists |
+-| `--auth-scheme` | `bearer` | Authorization header scheme |
+-| `--discover` | — | print the raw field names one station reports, then exit |
+-| `--station` | — | station id for `--discover` |
+-
+-The output is long — `datetime, station_id, variable, value` — with one row per
+-variable per reading (a station reports several variables, so it's long in
+-`variable` as well as in time). This collector lands the sub-daily observations
+-faithfully and does **no** ET aggregation; daily `tmax`/`tmin`/`tmean` reduction
+-and gap handling are the ET `met` stage's job.
+-
+-Three things about this feed, all handled by the adapter:
+-
+-- **Auth is `Bearer <key>`** from `$ETHEKWINI_FEWS_KEY`. A `401` means the key is
+-  absent in the shell you ran from.
+-- **It rate-limits.** Requests are paced `--min-interval` apart and a `429`/`503`
+-  is retried with backoff, honouring `Retry-After`; with `--cache-dir` set a
+-  throttled run resumes rather than restarting.
+-- **No data is normal.** An offline station, or a window predating its record,
+-  returns an empty `weather` list. That station is skipped and flagged `no data`
+-  in the run report, never raised — scan the report for stations that came back
+-  empty.
+-
+-**Confirm the field map before trusting the numbers.** The response envelope is
+-confirmed (`response.data.weather`, a list of readings), but the field *names*
+-inside a reading are not. `VARIABLE_MAP` in the module maps expected raw names
+-onto the canonical ET variables (`temp`, `rh`, `wind`, `solar`, …); unmapped
+-keys are ignored, so an unpinned map yields a short file, never a wrong one. Pin
+-it against live data once:
+-
+-```bash
+-python -m topkapi_setup.forcing.sources.weather_measurements \
+-    --discover --station 3393 --start 20250101 --end 20250102
+-```
+-
+-It prints each raw field and what it maps to (`(unmapped)` for the rest); adjust
+-`VARIABLE_MAP` one line per field. Pick a warm, non-empty window so readings
+-exist to inspect.
+-
+-**Timezone — confirm before calibration.** As with rainfall, stamps are emitted
+-naive; set the zone once on the ET `Timeline` and pin it against a known onset. A
+-silent 2 h offset is invisible in daily ET totals but wrong against the diurnal
+-disaggregation.
+-
+-### QC and daily-reduce the weather record — `met`
+-
+-Between the raw `weather_measurements.csv` and the ET₀ calc sits one cleaning
+-step. The feed lands dropouts as in-band numbers (a `temp` of `0.0`, a `wind`
+-of `-9990`), and FAO-56 is computed daily, so `met` drops the sentinels per
+-variable and collapses the sub-daily readings to a per-station daily table —
+-the input `penman` (next stage) reduces to ET₀/E₀.
+-
+-```bash
+-python -m topkapi_setup.forcing.met \
+-    --measurements projects/umhlanga/forcing/weather_measurements.csv \
+-    --manifest     projects/umhlanga/forcing/weather_manifest.csv \
+-    --tz Africa/Johannesburg \
+-    --out          projects/umhlanga/forcing/weather_daily.csv
+-```
+-
+-It prints three things and (with `--out`) writes the daily table:
+-
+-- **QA report** — readings dropped per station/variable. Scan the
+-  `pct_dropped` column: a few percent on `temp` is the `0.0` dropout, a chunk on
+-  `wind` is the `-9990` flag; `solar` should be `0.0` (night zeros are kept, not
+-  dropped).
+-- **Daily table (head)** — one row per station per day: `tmax/tmin/tmean`, mean
+-  `wind`, mean `solar`, `rh`/`tdew` where the feed reports them (NaN when it
+-  doesn't — which sends `penman` to the Hargreaves fallback).
+-- **Coverage** — days with a *complete* aggregate per variable. A station with
+-  many days but few complete `wind` days is telling you wind is the weak input
+-  before it quietly biases ET₀.
+-
+-| Flag | Default | Purpose |
+-|---|---|---|
+-| `--measurements` | required | long `weather_measurements.csv` |
+-| `--manifest` | none | `weather_manifest.csv`; checks station ids and flags any in the measurements but absent from the manifest |
+-| `--tz` | none | timezone for the calendar-day boundary; pass the run's `Timeline` tz (e.g. `Africa/Johannesburg`) |
+-| `--min-coverage` | `0.8` | fraction of a day's expected readings a variable needs, or that day's aggregate is suppressed to NaN |
+-| `--out` | none | write the daily table to CSV |
+-
+-`--min-coverage` is the guard against a warm-biased `tmax` from a half-empty
+-day: the expected count is inferred from each station's own modal step (48 for
+-the half-hourly feed), so a logger outage or the ragged first/last day of a
+-record lands as NaN rather than a fake extreme. The sentinel rules are the
+-per-variable `QA_RULES` in `met.py` — override them there if a station needs a
+-tighter range.
+-
+ ### 4.3 End to end, in Python
+ 
+ The `forcing` CLI above is a thin wrapper over this sequence. Reach for the
+@@ -883,6 +735,198 @@ than shrinking the catchment to a dot. Colouring gauges on the field's own scale
+ is the isohyetal check the design note describes — a faithful contour reading of
+ the IDW surface, without a separate code path.
+ 
++---
++
++## 5. Build the ET forcing  —  `met` + `penman`  (M3)
++
++Produces the two demand fields the solver reads from `ET.h5`: `ETr`
++(reference-crop ET, grass) and `ETo` (open-water evaporation), each shaped
++`(n_timesteps, n_cells)` in the **same cell order** as `cell_param.dat`. Three
++stages: source the weather stations (5.1), clean and daily-reduce the record
++(5.2), then compute ET0/E0 (5.3). The weather pair mirrors the rainfall pair in
++§4.1 exactly, on the same `Timeline`.
++
++### 5.1 Sourcing weather stations from eThekwini FEWS
++
++The ET stage needs a weather manifest and a long measurements file, the ET twins
++of the rainfall pair in 4.1. Two adapters under `topkapi_setup/forcing/sources/`
++build them from the same eThekwini FEWS network. Both are thin CLIs; run them in
++order.
++
++```
++/stations ──weather_manifest──▶ weather_manifest.csv ──weather_measurements──▶ weather_measurements.csv
++```
++
++**Scope the network to the catchment — `weather_manifest`.** Fetches the live
++station list (or reads a saved dump), keeps stations that carry a `weather`
++device and fall within a buffer of the catchment, samples each station's
++elevation from the DEM, and writes the manifest.
++
++```bash
++export ETHEKWINI_FEWS_KEY=…            # Authorization header, never the URL
++python -m topkapi_setup.forcing.sources.weather_manifest \
++    --mask projects/umhlanga/terrain/mask.tif \
++    --dem  projects/umhlanga/terrain/dem_utm36s.tif \
++    --out  projects/umhlanga/forcing/weather_manifest.csv \
++    --buffer-km 20
++```
++
++`--network` is optional: omit it to fetch `/api/v1/stations` live, or pass a
++saved dump (Python-literal or strict JSON, both parse). `--mask` is the
++`terrain.py` mask and must be projected in metres — the buffer distance and the
++output coordinates are metres in its CRS. Only stations with a non-empty
++`devices.weather` are kept; the weather-less placeholders in the dump are
++dropped. The output follows the ET manifest contract
++(`station_id, x, y, crs, elevation_m, name, source`) plus two carried columns:
++`device` (instrument serial, provenance only) and `in_mask`.
++
++**`--dem` is not optional for Penman–Monteith.** The API carries no elevation,
++but FAO-56 needs it (air pressure, hence γ, hence ET₀, depends on station
++height), so the manifest samples the terrain DEM. A far buffer station off the
++DEM footprint is left `elevation_m` blank with a warning rather than given a fake
++height — the ET stage can fall back to temperature-only Hargreaves there. Omit
++`--dem` entirely and every elevation is blank (a Hargreaves-only run).
++
++Keep the buffer. A station just outside the divide still constrains the ET field
++at the edge; `in_mask` records which stations are strictly inside. ET₀ varies
++smoothly, so a couple of stations is ample — for the Ohlanga, one broadcast
++uniformly is reasonable.
++
++**Pull the series — `weather_measurements`.** Fetches each station in the
++manifest over a date window and writes the long `weather_measurements.csv`.
++
++```bash
++python -m topkapi_setup.forcing.sources.weather_measurements \
++    --manifest  projects/umhlanga/forcing/weather_manifest.csv \
++    --start 20250101 --end 20250131 \
++    --out       projects/umhlanga/forcing/weather_measurements.csv \
++    --cache-dir projects/umhlanga/raw/weather
++```
++
++| Flag | Default | Purpose |
++|---|---|---|
++| `--cache-dir` | none | raw JSON per station-window; provenance, and resumes a run |
++| `--min-interval` | `1.0` | seconds between requests; raise it if `429` persists |
++| `--auth-scheme` | `bearer` | Authorization header scheme |
++| `--discover` | — | print the raw field names one station reports, then exit |
++| `--station` | — | station id for `--discover` |
++
++The output is long — `datetime, station_id, variable, value` — with one row per
++variable per reading (a station reports several variables, so it's long in
++`variable` as well as in time). This collector lands the sub-daily observations
++faithfully and does **no** ET aggregation; daily `tmax`/`tmin`/`tmean` reduction
++and gap handling are the ET `met` stage's job.
++
++Three things about this feed, all handled by the adapter:
++
++- **Auth is `Bearer <key>`** from `$ETHEKWINI_FEWS_KEY`. A `401` means the key is
++  absent in the shell you ran from.
++- **It rate-limits.** Requests are paced `--min-interval` apart and a `429`/`503`
++  is retried with backoff, honouring `Retry-After`; with `--cache-dir` set a
++  throttled run resumes rather than restarting.
++- **No data is normal.** An offline station, or a window predating its record,
++  returns an empty `weather` list. That station is skipped and flagged `no data`
++  in the run report, never raised — scan the report for stations that came back
++  empty.
++
++**Check for unmapped fields when a feed changes.** The reading fields are mapped onto the canonical ET variables (`temp`, `rh`, `wind`, `solar`, …) by `VARIABLE_MAP` in the module; unmapped keys are ignored, so a feed that adds or renames a field yields a short file, never a wrong one. `--discover` prints each raw field and what it maps to (`(unmapped)` for the rest), so pinning a new one is a one-line edit:
++
++```bash
++python -m topkapi_setup.forcing.sources.weather_measurements \
++    --discover --station 3393 --start 20250101 --end 20250102
++```
++
++Pick a warm, non-empty window so readings exist to inspect.
++
++**Timezone — confirm before calibration.** As with rainfall, stamps are emitted
++naive; set the zone once on the ET `Timeline` and pin it against a known onset. A
++silent 2 h offset is invisible in daily ET totals but wrong against the diurnal
++disaggregation.
++
++### 5.2 QC and daily-reduce the weather record — `met`
++
++Between the raw `weather_measurements.csv` and the ET₀ calc sits one cleaning
++step. The feed lands dropouts as in-band numbers (a `temp` of `0.0`, a `wind`
++of `-9990`), and FAO-56 is computed daily, so `met` drops the sentinels per
++variable and collapses the sub-daily readings to a per-station daily table —
++the input `penman` (next stage) reduces to ET₀/E₀.
++
++```bash
++python -m topkapi_setup.forcing.met \
++    --measurements projects/umhlanga/forcing/weather_measurements.csv \
++    --manifest     projects/umhlanga/forcing/weather_manifest.csv \
++    --tz Africa/Johannesburg \
++    --out          projects/umhlanga/forcing/weather_daily.csv
++```
++
++It prints three things and (with `--out`) writes the daily table:
++
++- **QA report** — readings dropped per station/variable. Scan the
++  `pct_dropped` column: a few percent on `temp` is the `0.0` dropout, a chunk on
++  `wind` is the `-9990` flag; `solar` should be `0.0` (night zeros are kept, not
++  dropped).
++- **Daily table (head)** — one row per station per day: `tmax/tmin/tmean`, mean
++  `wind`, mean `solar`, and `rh` (from the feed's `relativeHumidity`). Penman-Monteith
++  uses all of these; a station missing humidity falls back to Hargreaves.
++- **Coverage** — days with a *complete* aggregate per variable. A station with
++  many days but few complete `wind` days is telling you wind is the weak input
++  before it quietly biases ET₀.
++
++| Flag | Default | Purpose |
++|---|---|---|
++| `--measurements` | required | long `weather_measurements.csv` |
++| `--manifest` | none | `weather_manifest.csv`; checks station ids and flags any in the measurements but absent from the manifest |
++| `--tz` | none | timezone for the calendar-day boundary; pass the run's `Timeline` tz (e.g. `Africa/Johannesburg`) |
++| `--min-coverage` | `0.8` | fraction of a day's expected readings a variable needs, or that day's aggregate is suppressed to NaN |
++| `--out` | none | write the daily table to CSV |
++
++`--min-coverage` is the guard against a warm-biased `tmax` from a half-empty
++day: the expected count is inferred from each station's own modal step (48 for
++the half-hourly feed), so a logger outage or the ragged first/last day of a
++record lands as NaN rather than a fake extreme. The sentinel rules are the
++per-variable `QA_RULES` in `met.py` — override them there if a station needs a
++tighter range.
++
++### 5.3 Reference and open-water ET — `penman`
++
++Turns the daily table into the two demand fields the solver reads: `ET0` (`ETr`,
++reference grass) and open-water `E0` (`ETo`, the channel rate). FAO-56
++Penman-Monteith where radiation and humidity allow, Hargreaves (temperature
++only) where they don't — chosen per station-day.
++
++```bash
++python -m topkapi_setup.forcing.penman \
++    --daily    projects/umhlanga/forcing/weather_daily.csv \
++    --manifest projects/umhlanga/forcing/weather_manifest.csv \
++    --out      projects/umhlanga/forcing/et0_daily.csv
++```
++
++It prints the method split (Penman-Monteith vs Hargreaves), per-station ET0
++min/mean/max, and the head; with `--out` it writes `station_id, date, et0, eto,
++method`. Latitude comes from the manifest coordinates (reprojected to lon/lat),
++elevation from its `elevation_m` — both feed the radiation and pressure terms.
++
++| Flag | Default | Purpose |
++|---|---|---|
++| `--daily` | required | daily table from `met` |
++| `--manifest` | required | weather manifest — supplies `elevation_m` and latitude |
++| `--wind-height` | `2.0` | anemometer height (m) for the 2 m adjustment; set 10 for a typical AWS once confirmed |
++| `--method` | `auto` | `auto` (Penman-Monteith where data allow, else Hargreaves) or `hargreaves` to force temperature-only |
++| `--out` | none | write the per-station-day ET0/ETo CSV |
++
++Two things worth a glance. **`ET0` is mm/day here** — the split into mm-per-`Dt`
++depths, weighted by clear-sky radiation so evaporation follows the sun, is the
++disaggregation step that the ET.h5 writer owns, not this one. And **Hargreaves
++is temperature-driven**, so a stuck-high `tmax` inflates it directly (a 48 °C
++sensor day gives a ~10 mm/day ET0 that is not real); tighten the temperature
++ceiling in `met`'s `QA_RULES`, or lean on Penman-Monteith, which is
++radiation-driven and less hostage to a bad `tmax`. The everyday FAO-56 formulas
++live as pure functions in `penman.py`, checked against the FAO-56 worked example
++(ET0 = 3.9 mm/day), for when you want them from a notebook.
++
++*Still to land in the ET stage: the clear-sky diurnal disaggregation and the
++`(n_t, n_cells)` writer to `ET.h5` (with the same cell-order guard as §4.6).*
++
+ ---
+ ## Writing new stages
+ 
+@@ -910,5 +954,6 @@ A module is not "done" until (1)–(5) hold and the suite is green.
+ | M1 | preflight / terrain / viz | `preflight`, `terrain`, `viz` | done |
+ | M2 | parameter rasters | `params`, `soil_table` | done |
+ | M3 | forcing builder (rainfall) | `forcing`, `forcing.sources.*` | done |
++| M3 | forcing builder (ET) | `met`, `penman`, `forcing.sources.weather_*` | sources/met/penman done; ET.h5 writer to do |
+ | M4 | config + run (`--check`) | `config`, `run` | to do |
+ | M5 | calibration | `calibrate` | to do |
+diff --git a/topkapi_setup/forcing/penman.py b/topkapi_setup/forcing/penman.py
+index 5e0c981..1b6cff5 100644
+--- a/topkapi_setup/forcing/penman.py
++++ b/topkapi_setup/forcing/penman.py
+@@ -395,3 +395,109 @@ def reference_et0(row, latitude, measured_wind_height=2.0):
+ 
+     et0 = et0_hargreaves(tmax, tmin, doy, latitude, tmean=tmean)
+     return float(et0), "hargreaves"
++
++
++# ---------------------------------------------------------------------------
++# CLI -- daily ET0/E0 per station from a met daily table
++# ---------------------------------------------------------------------------
++
++def et0_eto_frame(daily, manifest, *, wind_height=2.0, method="auto"):
++    """Compute daily ``et0`` (ETr) and ``eto`` (E0 open water) per station-day.
++
++    ``daily`` is the :func:`met.daily_table` output (a DataFrame or its CSV path);
++    ``manifest`` is the weather manifest (DataFrame or path) -- it supplies each
++    station's ``elevation_m`` and, via its coordinates, latitude.  ``eto`` is the
++    open-water Penman evaporation where the full energy balance is available and
++    falls back to ``eto = et0`` otherwise (the design-note channel-evaporation
++    shortcut).  Returns a frame ``station_id, date, et0, eto, method``.
++    """
++    from pyproj import Transformer
++    from . import met as _met
++
++    if not isinstance(daily, pd.DataFrame):
++        daily = pd.read_csv(daily, parse_dates=["date"])
++    daily = daily.copy()
++    daily["station_id"] = daily["station_id"].astype(str).str.strip()
++
++    man = manifest if isinstance(manifest, pd.DataFrame) else _met.read_manifest(manifest)
++    # latitude (degrees) per station: reproject the model-CRS coordinates back
++    # to lon/lat, so it is correct whatever CRS the manifest declared.
++    tx = Transformer.from_crs(str(man["crs"].iloc[0]), "EPSG:4326", always_xy=True)
++    _, lat = tx.transform(man["x"].to_numpy(float), man["y"].to_numpy(float))
++    lat_of = dict(zip(man.index, lat))
++    elev_of = man["elevation_m"].to_dict()
++
++    rows = []
++    for rec in daily.to_dict("records"):
++        sid = rec["station_id"]
++        if sid not in lat_of:
++            continue
++        rec["elevation_m"] = elev_of.get(sid, np.nan)
++        latitude = lat_of[sid]
++
++        forced_harg = method == "hargreaves"
++        et0, used = reference_et0(rec, latitude, measured_wind_height=wind_height)
++        if forced_harg and not pd.isna(rec.get("tmax")) and not pd.isna(rec.get("tmin")):
++            doy = day_of_year(rec["date"])[0]
++            et0 = float(et0_hargreaves(rec["tmax"], rec["tmin"], doy, latitude,
++                                       tmean=rec.get("tmean")))
++            used = "hargreaves"
++
++        # open-water ETo: full Penman where energy + humidity exist, else = ETr
++        eto = et0
++        if used == "penman_monteith":
++            ea = (ea_from_tdew(rec["tdew"]) if not pd.isna(rec.get("tdew"))
++                  else ea_from_rhmean(rec["rh"], rec["tmax"], rec["tmin"]))
++            eto = float(e0_open_water(
++                rec["tmax"], rec["tmin"], rs_from_wm2(rec["solar"]),
++                wind_speed_2m(rec["wind"], wind_height), ea,
++                rec["elevation_m"], latitude, day_of_year(rec["date"])[0],
++                tmean=rec.get("tmean")))
++
++        rows.append({"station_id": sid, "date": rec["date"],
++                     "et0": et0, "eto": eto, "method": used})
++
++    return pd.DataFrame(rows, columns=["station_id", "date", "et0", "eto", "method"])
++
++
++def _cli(argv=None):
++    import argparse
++
++    p = argparse.ArgumentParser(
++        description="Daily reference ET0 (ETr) and open-water E0 (ETo) per "
++                    "station from a `met` daily table.",
++    )
++    p.add_argument("--daily", required=True,
++                   help="weather_daily.csv from `met` (station_id, date, tmax, …)")
++    p.add_argument("--manifest", required=True,
++                   help="weather_manifest.csv (elevation_m + coordinates)")
++    p.add_argument("--out", default=None, help="write per-station-day ET0/ETo CSV")
++    p.add_argument("--wind-height", type=float, default=2.0,
++                   help="anemometer height (m) for the 2 m adjustment "
++                        "(default 2.0; set 10 for a typical AWS once confirmed)")
++    p.add_argument("--method", choices=["auto", "hargreaves"], default="auto",
++                   help="'auto' uses Penman-Monteith where radiation+humidity "
++                        "allow, else Hargreaves; 'hargreaves' forces the "
++                        "temperature-only method everywhere")
++    args = p.parse_args(argv)
++
++    out = et0_eto_frame(args.daily, args.manifest,
++                        wind_height=args.wind_height, method=args.method)
++    good = out[out["et0"].notna()]
++
++    print("=== method used (station-days) ===")
++    print(out["method"].value_counts().to_string())
++    print("\n=== ET0 (mm/day) per station ===")
++    summ = (good.groupby("station_id")["et0"]
++            .agg(["count", "min", "mean", "max"]).round(2))
++    print(summ.to_string())
++    print("\n=== head ===")
++    print(out.head(10).to_string(index=False))
++
++    if args.out:
++        out.to_csv(args.out, index=False)
++        print(f"\n{len(out)} station-days -> {args.out}")
++
++
++if __name__ == "__main__":
++    _cli()
