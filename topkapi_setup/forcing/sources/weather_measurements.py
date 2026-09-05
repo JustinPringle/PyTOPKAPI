@@ -114,7 +114,7 @@ VARIABLE_MAP = {
     "tmax": "tmax", "tmin": "tmin", "tmean": "tmean",
     # humidity
     "rh": "rh", "humidity": "rh", "relhumidity": "rh",
-    "relative_humidity": "rh", "humid": "rh",
+    "relativehumidity": "rh", "humid": "rh",
     "dewpoint": "tdew", "dew_point": "tdew", "tdew": "tdew",
     # wind (speed at whatever height; met.py adjusts to 2 m)
     "wind": "wind", "windspeed": "wind", "wind_speed": "wind",
