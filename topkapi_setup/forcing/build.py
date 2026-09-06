@@ -52,6 +52,7 @@ from topkapi_setup.forcing import rainfields as rf
 from topkapi_setup.forcing import met as mt
 from topkapi_setup.forcing import penman as pnm
 from topkapi_setup.forcing import etfields as ef
+from topkapi_setup.forcing import gapfill as gf
 
 __all__ = [
     "ForcingResult",
@@ -423,6 +424,7 @@ class ETResult:
     coverage: dict
     field_stats: dict
     sources: dict
+    gap_fill: dict = field(default_factory=dict)
     created: str = field(default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds"))
 
     def to_json(self, path) -> None:
@@ -461,6 +463,8 @@ def build_etfields(
     sill: float | None = None,
     et_method: str = "auto",
     wind_height: float = 2.0,
+    gap_fill: bool = True,
+    max_interp_gap: int = gf.DEFAULT_MAX_INTERP_GAP,
     min_coverage: float = mt.DEFAULT_MIN_COVERAGE,
     block_size: int = 720,
     compression: str | None = None,
@@ -504,6 +508,18 @@ def build_etfields(
         tz_meridian=tz_meridian, min_coverage=min_coverage,
     )
     paths = dict(zip(report["station_id"], report["path"]))
+
+    # 3b. Tier-2 temporal fill: patch each station's own series in time (short
+    #     holes linearly, long ones by its diurnal climatology) so a step where
+    #     every station is out still carries values. Tier 1 (lean on the
+    #     neighbours) is the spatial renormalise the writer already does.
+    n_gap_filled = 0
+    if gap_fill:
+        orig_available = available          # etr and eto share the same gaps
+        etr, available, n_gap_filled = gf.fill_readings_in_time(
+            etr, orig_available, timeline, max_interp_gap=max_interp_gap)
+        eto, _, _ = gf.fill_readings_in_time(
+            eto, orig_available, timeline, max_interp_gap=max_interp_gap)
 
     # 3a. Refuse (or trim) a window the network can't cover, before the geometry.
     #     Reuse the rainfall guard on ETr; mirror any trim onto ETo.
@@ -578,6 +594,9 @@ def build_etfields(
         },
         field_stats=_et_field_summary(out_path, group_name, timeline),
         sources={"manifest": manifest_path, "measurements": measurements_path},
+        gap_fill={"enabled": bool(gap_fill),
+                  "max_interp_gap": int(max_interp_gap) if gap_fill else None,
+                  "station_steps_filled": int(n_gap_filled)},
     )
     result.to_json(result.manifest_json)
     return result
@@ -760,6 +779,14 @@ def _build_et_arg_parser():
     e.add_argument("--wind-height", type=float, default=2.0,
                    help="anemometer height (m) for the 2 m adjustment "
                         "(default 2.0; set 10 for a typical AWS once confirmed)")
+    e.add_argument("--no-gap-fill", action="store_true",
+                   help="disable the tier-2 temporal fill (short holes linearly, "
+                        "long ones by diurnal climatology); gaps then lean only "
+                        "on the spatial renormalise, and an all-station-out step "
+                        "is refused")
+    e.add_argument("--max-interp-gap", type=int, default=gf.DEFAULT_MAX_INTERP_GAP,
+                   help="longest hole (steps) filled by linear interpolation "
+                        "before falling to the diurnal climatology")
 
     m = p.add_argument_group("interpolation")
     m.add_argument("--method", default=ip.DEFAULT_METHOD, choices=list(ip.METHODS),
@@ -804,6 +831,7 @@ def _run_et(argv=None):
         variogram_model=args.variogram_model,
         range_m=None if args.range_km is None else args.range_km * 1000,
         sill=args.sill, et_method=args.et_method, wind_height=args.wind_height,
+        gap_fill=not args.no_gap_fill, max_interp_gap=args.max_interp_gap,
         min_coverage=args.min_coverage, block_size=args.block_size,
         compression=args.compression, check_cell_order=not args.no_guard,
         trim=args.trim,
@@ -821,6 +849,11 @@ def _run_et(argv=None):
     print(f"  stations: {result.n_stations_used} used of "
           f"{result.n_stations_manifest}  |  method: {result.method}")
     print(f"  ET resolution path per station: {paths}")
+    gfs = result.gap_fill
+    if gfs.get("enabled"):
+        print(f"  tier-2 temporal fill: {gfs['station_steps_filled']} station-steps "
+              f"patched in time (linear <= {gfs['max_interp_gap']} steps, else "
+              f"diurnal climatology)")
     print(f"  coverage: {result.coverage['min']:.0%} min, "
           f"{result.coverage['median']:.0%} median, "
           f"{result.coverage['max']:.0%} max")
