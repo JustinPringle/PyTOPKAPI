@@ -303,3 +303,95 @@ def test_group_required_when_ambiguous(scene):
                         overwrite=False)
     with pytest.raises(KeyError, match="rainfall groups present"):
         viz.plot_rainfield(res.rainfields, scene["mask"], t=0)
+
+
+# --------------------------------------------------------------------------
+# ET subcommand:  python -m topkapi_setup.forcing et
+# --------------------------------------------------------------------------
+
+def _et_scene(tmp_path):
+    """A 3x3 catchment, two weather stations, three half-hourly summer days."""
+    import numpy as np, pandas as pd, rasterio, json
+    from rasterio.transform import from_origin
+    from pyproj import Transformer
+    from topkapi_setup.forcing import interpolate as ip
+
+    tx = Transformer.from_crs("EPSG:4326", "EPSG:32736", always_xy=True)
+    ox, oy = tx.transform(31.06, -29.70)
+    mask = tmp_path / "mask.tif"
+    with rasterio.open(mask, "w", driver="GTiff", height=3, width=3, count=1,
+                       dtype="uint8", crs="EPSG:32736",
+                       transform=from_origin(ox, oy, 30, 30)) as ds:
+        ds.write(np.ones((3, 3), "uint8"), 1)
+
+    x, y = ip.catchment_cell_xy(str(mask))
+    cp = np.zeros((len(x), 21)); cp[:, 0] = np.arange(len(x)); cp[:, 1] = x; cp[:, 2] = y
+    cell_param = tmp_path / "cell_param.dat"
+    np.savetxt(cell_param, cp)
+
+    man = tmp_path / "wman.csv"
+    rows = [{"station_id": s, "x": tx.transform(lo, la)[0],
+             "y": tx.transform(lo, la)[1], "crs": "EPSG:32736", "elevation_m": 40.0}
+            for s, (lo, la) in {"A": (31.10, -29.72), "B": (31.05, -29.75)}.items()]
+    pd.DataFrame(rows).to_csv(man, index=False)
+
+    t = pd.date_range("2025-01-02 00:00", "2025-01-04 23:30", freq="30min")
+    h = t.hour + t.minute / 60.0
+    solar = np.clip(800.0 * np.sin(np.pi * (h - 6) / 12.0), 0, None)
+    temp = 20.0 + 6.0 * np.sin(np.pi * (h - 8) / 12.0)
+    frames = []
+    for s in ["A", "B"]:
+        for var, vals in {"temp": temp, "rh": np.full_like(h, 65.0),
+                          "wind": np.full_like(h, 2.0), "solar": solar}.items():
+            frames.append(pd.DataFrame({"datetime": t, "station_id": s,
+                                        "variable": var, "value": vals}))
+    meas = tmp_path / "wmeas.csv"
+    pd.concat(frames, ignore_index=True).to_csv(meas, index=False)
+    return {"mask": str(mask), "cell_param": str(cell_param),
+            "manifest": str(man), "measurements": str(meas),
+            "out": str(tmp_path / "ET.h5")}
+
+
+def test_et_cli_builds_ethdf5_and_manifest_subdaily(tmp_path):
+    import json
+    from topkapi_setup.forcing import build as fb, etfields as ef
+
+    sc = _et_scene(tmp_path)
+    fb.main(["et", "--manifest", sc["manifest"], "--measurements", sc["measurements"],
+             "--mask", sc["mask"], "--cell-param", sc["cell_param"],
+             "--start", "2025-01-03 01:00", "--end", "2025-01-04 00:00", "--dt", "3600",
+             "--group", "ev", "--min-coverage", "0.5", "--out", sc["out"]])
+
+    etr, eto = ef.read_etfields(sc["out"], group_name="ev")
+    assert etr.shape == (24, 9) and eto.shape == (24, 9)          # 24 hourly steps, 9 cells
+    assert (etr >= 0).all() and np.isfinite(etr).all()
+
+    m = json.loads((tmp_path / "forcing_manifest.json").read_text())
+    assert "et" in m
+    assert set(m["et"]["paths"].values()) == {"subdaily"}         # 30-min feed used directly
+    assert m["et"]["n_stations_used"] == 2
+
+
+def test_et_cli_disaggregates_daily_input(tmp_path):
+    import json, numpy as np, pandas as pd
+    from topkapi_setup.forcing import build as fb, etfields as ef
+
+    sc = _et_scene(tmp_path)
+    # overwrite measurements with a DAILY feed (one reading per var per day)
+    rows = []
+    for d in ["2025-01-02", "2025-01-03", "2025-01-04"]:
+        for s in ["A", "B"]:
+            for var, val in {"temp": 24.0, "rh": 60.0, "wind": 2.0,
+                             "solar": 300.0}.items():
+                rows.append({"datetime": pd.Timestamp(f"{d} 12:00"),
+                             "station_id": s, "variable": var, "value": val})
+    pd.DataFrame(rows).to_csv(sc["measurements"], index=False)
+
+    fb.main(["et", "--manifest", sc["manifest"], "--measurements", sc["measurements"],
+             "--mask", sc["mask"], "--cell-param", sc["cell_param"],
+             "--start", "2025-01-03 01:00", "--end", "2025-01-04 00:00", "--dt", "3600",
+             "--group", "ev", "--out", sc["out"]])
+    m = json.loads((tmp_path / "forcing_manifest.json").read_text())
+    assert set(m["et"]["paths"].values()) == {"daily->disaggregated"}
+    etr, _ = ef.read_etfields(sc["out"], group_name="ev")
+    assert float(etr.sum()) > 0.0

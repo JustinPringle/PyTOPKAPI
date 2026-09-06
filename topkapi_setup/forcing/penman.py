@@ -56,13 +56,31 @@ __all__ = [
     "wind_speed_2m",
     "penman_monteith_combine", "et0_penman_monteith",
     "et0_hargreaves", "e0_open_water",
-    "reference_et0",
+    "reference_et0", "et0_eto_frame",
+    # sub-daily / hourly (Allen 2006)
+    "SIGMA_HOUR", "CN_DAILY", "CD_DAILY",
+    "CN_HOURLY", "CD_HOURLY_DAY", "CD_HOURLY_NIGHT",
+    "seasonal_correction", "extraterrestrial_radiation_hourly",
+    "daily_cloudiness_factor", "rs_rate_from_wm2", "net_radiation_hourly",
+    "et0_penman_monteith_hourly",
+    # routing
+    "et0_eto_on_clock",
 ]
 
 #: Solar constant (MJ m^-2 min^-1), FAO-56 Eq. 28.
 GSC = 0.0820
 #: Stefan-Boltzmann (MJ K^-4 m^-2 day^-1), FAO-56 Eq. 39.
 SIGMA = 4.903e-9
+#: The same, per hour -- the hourly longwave uses the hour's own T^4.
+SIGMA_HOUR = SIGMA / 24.0
+
+#: ASCE/FAO-56 reference-ET numerator/denominator coefficients (Allen 2006).
+#: The daily pair is the FAO-56 Eq. 6 constants; the hourly pair (short grass
+#: reference) is what makes sub-daily met usable directly instead of a daily
+#: total smeared back across the hours.
+CN_DAILY, CD_DAILY = 900.0, 0.34
+CN_HOURLY = 37.0
+CD_HOURLY_DAY, CD_HOURLY_NIGHT = 0.24, 0.96
 #: Reference-grass and open-water albedos.
 ALBEDO_GRASS = 0.23
 ALBEDO_WATER = 0.08
@@ -269,20 +287,32 @@ def wind_speed_2m(u, measured_height=2.0):
 # Penman-Monteith reference ET
 # ---------------------------------------------------------------------------
 
-def penman_monteith_combine(delta, rn, g, gamma, tmean, u2, es_minus_ea):
-    """The FAO-56 Eq. 6 combination, given its assembled terms.
+def penman_monteith_combine(delta, rn, g, gamma, tmean, u2, es_minus_ea,
+                            cn=CN_DAILY, cd=CD_DAILY):
+    """The FAO-56 / ASCE combination equation, given its assembled terms.
 
-    Split out so the arithmetic can be checked directly against the published
-    worked example: ``delta=0.122, rn=13.28, g=0, gamma=0.0666, tmean=16.9,
-    u2=2.078, es_minus_ea=0.589`` -> ``3.88`` mm/day.
+    The one equation serves both time steps; only the two reference
+    coefficients change (Allen et al., 2006):
+
+    ``cn=900, cd=0.34`` (**daily**, the defaults)
+        ``rn``/``g`` in MJ/m^2/day, ``es_minus_ea`` from Tmax/Tmin, result
+        mm/day.  Checked against the FAO-56 worked example: ``delta=0.122,
+        rn=13.28, g=0, gamma=0.0666, tmean=16.9, u2=2.078, es_minus_ea=0.589``
+        -> ``3.88`` mm/day.
+
+    ``cn=37, cd=0.24`` day / ``0.96`` night (**hourly**)
+        ``rn``/``g`` in MJ/m^2/hour, ``es_minus_ea`` from the hour's own
+        temperature, result mm/hour.  ``cd`` (and the ``g`` the caller passes)
+        switch on whether the hour is daylit; see
+        :func:`et0_penman_monteith_hourly`.
     """
     delta = np.asarray(delta, dtype=float)
     gamma = np.asarray(gamma, dtype=float)
     u2 = np.asarray(u2, dtype=float)
     num = (0.408 * delta * (np.asarray(rn, dtype=float) - g)
-           + gamma * (900.0 / (np.asarray(tmean, dtype=float) + 273.0))
+           + gamma * (cn / (np.asarray(tmean, dtype=float) + 273.0))
            * u2 * np.asarray(es_minus_ea, dtype=float))
-    den = delta + gamma * (1.0 + 0.34 * u2)
+    den = delta + gamma * (1.0 + cd * u2)
     return num / den
 
 
@@ -355,6 +385,126 @@ def e0_open_water(tmax, tmin, rs, u2, ea, elevation, latitude, doy, tmean=None):
     rn_mm = 0.408 * rn
     ea_term = 0.26 * (1.0 + 0.54 * np.asarray(u2, dtype=float)) * (es - ea)
     return (delta * rn_mm + gamma * ea_term) / (delta + gamma)
+
+
+# ---------------------------------------------------------------------------
+# Sub-daily radiation and reference ET (FAO-56 hourly / Allen 2006)
+#
+# When the met feed is already sub-daily -- the eThekwini network reports every
+# half hour -- computing ET at the model step from those readings is strictly
+# better than collapsing to a daily total and smearing it back across the hours
+# by a clear-sky shape: the measured radiation, temperature, humidity and wind
+# carry the real diurnal signal, clouds and all. That is the "use it explicitly"
+# path. Disaggregation is reserved for genuinely daily input (see the routing in
+# :func:`et0_eto_on_clock`).
+# ---------------------------------------------------------------------------
+
+def seasonal_correction(doy):
+    """Seasonal correction for solar time Sc [hour].  FAO-56 Eqs. 32-33."""
+    b = 2 * np.pi * (np.asarray(doy, dtype=float) - 81) / 364.0
+    return 0.1645 * np.sin(2 * b) - 0.1255 * np.cos(b) - 0.025 * np.sin(b)
+
+
+def extraterrestrial_radiation_hourly(latitude, longitude, doy, clock_hour,
+                                       period_hours=1.0, tz_meridian=None):
+    """Extraterrestrial radiation Ra for one sub-daily period [MJ/m^2/period].
+
+    FAO-56 Eq. 28.  ``clock_hour`` is the **midpoint** of the period in local
+    standard clock time; ``tz_meridian`` is the longitude (deg, east positive)
+    of that clock's standard meridian -- 30 for SAST (UTC+2).  Pass
+    ``tz_meridian=None`` to treat the clock as already solar (no longitude/
+    equation-of-time shift), which is the right default for a naive clock.
+
+    This doubles as the clear-sky **shape** for the daily-input disaggregation
+    path: night periods return ~0, midday the most, from pure solar geometry.
+    """
+    phi = np.radians(np.asarray(latitude, dtype=float))
+    j = np.asarray(doy, dtype=float)
+    dr = 1.0 + 0.033 * np.cos(2 * np.pi * j / 365.0)
+    decl = 0.409 * np.sin(2 * np.pi * j / 365.0 - 1.39)
+
+    t = np.asarray(clock_hour, dtype=float)
+    if tz_meridian is None:
+        w = (np.pi / 12.0) * (t - 12.0)                       # clock == solar
+    else:
+        # FAO Eq. 31 in east-positive longitude: +(Lm - Lz)/15 hours.
+        lm = np.asarray(longitude, dtype=float)
+        shift = (lm - float(tz_meridian)) / 15.0 + seasonal_correction(j)
+        w = (np.pi / 12.0) * ((t + shift) - 12.0)
+
+    t1 = np.pi * float(period_hours) / 24.0
+    w1, w2 = w - t1, w + t1
+    ra = (12 * 60 / np.pi) * GSC * dr * (
+        (w2 - w1) * np.sin(phi) * np.sin(decl)
+        + np.cos(phi) * np.cos(decl) * (np.sin(w2) - np.sin(w1)))
+    return np.clip(ra, 0.0, None)                             # night -> 0
+
+
+def daily_cloudiness_factor(rs_day, ra_day, elevation):
+    """Longwave cloudiness factor ``1.35 Rs/Rso - 0.35`` from **daily** totals.
+
+    The hourly longwave needs the ``Rs/Rso`` ratio, but at night Rso is ~0 and
+    the ratio is undefined.  FAO-56 handles this by carrying a daytime value
+    through the night; taking the ratio from the day's totals does the same
+    thing more simply and is stable, since cloudiness varies slowly.  The caller
+    computes this once per station-day and applies it to every hour of the day.
+    """
+    rso_day = clear_sky_radiation(ra_day, elevation)
+    ratio = np.clip(np.asarray(rs_day, dtype=float) / rso_day, None, 1.0)
+    return np.clip(1.35 * ratio - 0.35, 0.05, 1.0)
+
+
+def rs_rate_from_wm2(mean_wm2):
+    """Period-mean solar irradiance [W/m^2] -> Rs **rate** [MJ/m^2/hour].
+
+    ``Rs_rate = mean_wm2 * 3600 / 1e6``.  The hourly ET stack works in rates
+    (per hour), so the model step ``Dt`` scales the depth once at the end,
+    letting the very same code serve an hourly or a half-hourly ``Dt``.
+    """
+    return np.asarray(mean_wm2, dtype=float) * 3600.0 / 1e6
+
+
+def net_radiation_hourly(rs, t, ea, fcd, albedo=ALBEDO_GRASS):
+    """Net-radiation **rate** Rn [MJ/m^2/hour] for a sub-daily period.
+
+    ``rs`` is the period-mean shortwave as a rate MJ/m^2/hour (use
+    :func:`rs_rate_from_wm2` on the W/m^2 feed); ``fcd`` the cloudiness factor
+    from :func:`daily_cloudiness_factor`.  The longwave uses the period's own
+    temperature ``t`` and the hourly Stefan-Boltzmann constant.
+    """
+    rns = (1.0 - albedo) * np.asarray(rs, dtype=float)
+    tk4 = (np.asarray(t, dtype=float) + 273.16) ** 4
+    rnl = (SIGMA_HOUR * tk4
+           * (0.34 - 0.14 * np.sqrt(np.clip(np.asarray(ea, dtype=float), 0, None)))
+           * np.asarray(fcd, dtype=float))
+    return rns - rnl
+
+
+def et0_penman_monteith_hourly(t, rs, u2, ea, elevation, fcd, *,
+                               period_hours=1.0):
+    """FAO-56 hourly reference ET0 [mm/period] from one period's met.
+
+    ``t`` the period-mean temperature [degC], ``rs`` the period-mean shortwave
+    as a **rate** [MJ/m^2/hour] (:func:`rs_rate_from_wm2`), ``u2`` wind at 2 m
+    [m/s], ``ea`` actual vapour pressure [kPa], ``fcd`` the daily cloudiness
+    factor.  Day vs night (the ``Cd`` and soil-heat-flux switch) is decided from
+    the sign of Rn -- positive by day, negative at night -- exactly as ASCE
+    prescribes.  The hourly rate is scaled by ``period_hours`` (the model ``Dt``
+    in hours), so a run of periods sums to the day's ET with no separate step.
+    """
+    t = np.asarray(t, dtype=float)
+    rn = net_radiation_hourly(rs, t, ea, fcd, albedo=ALBEDO_GRASS)
+    day = rn > 0
+    g = np.where(day, 0.1 * rn, 0.5 * rn)
+    cd = np.where(day, CD_HOURLY_DAY, CD_HOURLY_NIGHT)
+    delta = svp_slope(t)
+    gamma = psychrometric_constant(elevation=elevation)
+    es = svp(t)                       # hourly: es is e0 at the hour's own T
+    et = penman_monteith_combine(delta, rn, g, gamma, t, u2, es - ea,
+                                 cn=CN_HOURLY, cd=cd)
+    # A cold, dry, windy night can push the combination slightly below zero;
+    # ET does not run backwards, so floor it. (~0 already, per FAO Ex. 19.)
+    return np.clip(et * float(period_hours), 0.0, None)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +608,204 @@ def et0_eto_frame(daily, manifest, *, wind_height=2.0, method="auto"):
                      "et0": et0, "eto": eto, "method": used})
 
     return pd.DataFrame(rows, columns=["station_id", "date", "et0", "eto", "method"])
+
+
+def _station_lonlat_elev(manifest):
+    """Return ``{sid: (lon, lat, elevation_m)}`` from the weather manifest."""
+    from pyproj import Transformer
+    tx = Transformer.from_crs(str(manifest["crs"].iloc[0]), "EPSG:4326",
+                              always_xy=True)
+    lon, lat = tx.transform(manifest["x"].to_numpy(float),
+                            manifest["y"].to_numpy(float))
+    elev = manifest["elevation_m"].to_numpy(float)
+    return {sid: (float(lo), float(la), float(el))
+            for sid, lo, la, el in zip(manifest.index, lon, lat, elev)}
+
+
+def _clearsky_shape(timeline, latitude, longitude, tz_meridian):
+    """Clear-sky Ra at each step's midpoint -- the diurnal disaggregation shape."""
+    ends = timeline.times
+    mids = ends - timeline.dt / 2
+    hours = mids.hour + mids.minute / 60.0
+    ra = extraterrestrial_radiation_hourly(
+        latitude, longitude, mids.dayofyear.to_numpy(),
+        hours.to_numpy(), period_hours=timeline.dt_seconds / 3600.0,
+        tz_meridian=tz_meridian)
+    return pd.Series(ra, index=ends)
+
+
+def et0_eto_on_clock(clean, manifest, timeline, *, method="auto",
+                     wind_height=2.0, tz_meridian=None,
+                     min_coverage=None):
+    """Per-station ET0/ETo on the model clock, routed by data resolution.
+
+    This is the resolution decision the rainfall side makes per gauge, applied
+    to ET.  For each station, comparing its native sampling step to ``Dt``:
+
+    * **native <= Dt and Dt is sub-daily** -> compute **hourly Penman-Monteith**
+      at ``Dt`` from the step-aggregated met (:func:`et0_penman_monteith_hourly`).
+      The sub-daily feed is used as measured; nothing is disaggregated.
+    * **native > Dt and Dt is sub-daily** -> compute **daily** ET0
+      (:func:`et0_eto_frame`) and split it across the hours with the clear-sky
+      solar shape.  This is the *only* path that disaggregates.
+    * **Dt is daily** -> daily ET0 mapped to each daily step, no disaggregation.
+
+    Open-water ``eto`` on the hourly path is the hourly ``et0`` scaled by the
+    day's open-water ratio ``E0/ET0`` (from the daily Penman open-water), so it
+    keeps the sub-percent channel term consistent with the daily path and falls
+    back to ``eto = et0`` on temperature-only days.
+
+    Parameters
+    ----------
+    clean : DataFrame
+        Cleaned long measurements from :func:`met.clean_measurements`.
+    manifest : DataFrame
+        From :func:`met.read_manifest`; its index is the station-column order.
+    timeline : Timeline
+        The one clock; ``tz`` set here is honoured throughout.
+    tz_meridian : float, optional
+        Standard-meridian longitude of the clock (30 for SAST).  Only shifts the
+        clear-sky *shape* by a few minutes on the disaggregation path; leave
+        ``None`` for a naive clock.
+
+    Returns
+    -------
+    et0_readings, eto_readings : ndarray, shape (n_t, n_stations), mm per step
+    available : ndarray of bool, shape (n_t, n_stations)
+    report : DataFrame
+        One row per station: the ``path`` taken and its native step.
+    """
+    from . import met as _met
+
+    mc = _met.DEFAULT_MIN_COVERAGE if min_coverage is None else min_coverage
+    tz = timeline.times.tz
+    dt_hours = timeline.dt_seconds / 3600.0
+    dt_is_subdaily = timeline.dt < pd.Timedelta("1D")
+    station_ids = [str(s) for s in manifest.index]
+    geo = _station_lonlat_elev(manifest)
+
+    steps = _met.step_table(clean, timeline, min_coverage=mc)
+    daily = _met.daily_table(clean, tz=tz, min_coverage=mc)
+    daily_ee = et0_eto_frame(daily, manifest, wind_height=wind_height,
+                             method=method)
+
+    n_t = timeline.n_t
+    et0 = np.zeros((n_t, len(station_ids)))
+    eto = np.zeros((n_t, len(station_ids)))
+    avail = np.zeros((n_t, len(station_ids)), dtype=bool)
+    report = []
+
+    for col, sid in enumerate(station_ids):
+        native = _met.station_native_step(clean, sid)
+        lon, lat, elev = geo.get(sid, (np.nan, np.nan, np.nan))
+        subdaily_met = native is not None and native <= timeline.dt
+
+        if dt_is_subdaily and subdaily_met:
+            path = "subdaily"
+            e0, eo, ok = _hourly_path(
+                steps[steps["station_id"] == sid], daily_ee, sid, timeline,
+                lat, elev, wind_height, dt_hours)
+        else:
+            path = "daily->disaggregated" if dt_is_subdaily else "daily"
+            e0, eo, ok = _daily_path(
+                daily_ee, sid, timeline, lat, lon, tz_meridian, dt_is_subdaily)
+
+        et0[:, col], eto[:, col], avail[:, col] = e0, eo, ok
+        report.append({"station_id": sid, "path": path,
+                       "native_step": None if native is None else str(native)})
+
+    return et0, eto, avail, pd.DataFrame(report)
+
+
+def _daily_open_water_ratio(daily_ee, sid):
+    """Per-date ``E0/ET0`` for one station; 1.0 where ET0 is 0/NaN/Hargreaves."""
+    de = daily_ee[daily_ee["station_id"] == sid]
+    r = {}
+    for rec in de.to_dict("records"):
+        e0 = rec["et0"]
+        r[pd.Timestamp(rec["date"]).date()] = (
+            rec["eto"] / e0 if pd.notna(e0) and e0 > 0 else 1.0)
+    return r
+
+
+def _hourly_path(st, daily_ee, sid, timeline, lat, elev, wind_height, dt_hours):
+    """Hourly Penman-Monteith at Dt from step-aggregated met."""
+    ends = timeline.times
+    st = st.set_index("datetime").reindex(ends)
+    temp = st["temp"].to_numpy(float)
+    rh = st["rh"].to_numpy(float)
+    wind = st["wind"].to_numpy(float)
+    solar = st["solar"].to_numpy(float)
+
+    ok = np.isfinite(temp) & np.isfinite(rh) & np.isfinite(wind) & np.isfinite(solar)
+
+    # cloudiness factor per day, from the daily solar total vs clear-sky Ra
+    doy = ends.dayofyear.to_numpy()
+    ra_day = extraterrestrial_radiation(lat, doy)
+    de = daily_ee[daily_ee["station_id"] == sid].set_index("date")
+    # daily mean solar (W/m^2) -> MJ/m^2/day; pull from the daily table via met
+    # is cleaner, but daily_ee lacks it, so recompute the day means from steps:
+    day_key = pd.Index(ends.date)
+    rs_day_mm = np.full(len(ends), np.nan)
+    tmp = pd.Series(np.where(ok, solar, np.nan), index=ends)
+    day_mean_wm2 = tmp.groupby(ends.date).transform("mean").to_numpy()
+    rs_day_mm = rs_from_wm2(day_mean_wm2)
+    fcd = daily_cloudiness_factor(rs_day_mm, ra_day, elev)
+
+    et0 = np.zeros(len(ends))
+    with np.errstate(invalid="ignore"):
+        es = svp(temp)
+        ea = rh / 100.0 * es
+        rs_rate = rs_rate_from_wm2(solar)
+        u2 = wind_speed_2m(wind, wind_height)
+        vals = et0_penman_monteith_hourly(temp, rs_rate, u2, ea, elev, fcd,
+                                           period_hours=dt_hours)
+    et0[ok] = np.nan_to_num(vals[ok], nan=0.0)
+
+    # open-water: scale the hour by the day's E0/ET0 ratio
+    ratio_of = _daily_open_water_ratio(daily_ee, sid)
+    r = np.array([ratio_of.get(d, 1.0) for d in ends.date])
+    eto = et0 * r
+    return et0, eto, ok
+
+
+def _daily_path(daily_ee, sid, timeline, lat, lon, tz_meridian, dt_is_subdaily):
+    """Daily ET0, then either disaggregate to sub-daily Dt or map to daily Dt."""
+    from .gauges import disaggregate
+
+    ends = timeline.times
+    de = daily_ee[daily_ee["station_id"] == sid].copy()
+    de = de[pd.notna(de["et0"])]
+    if de.empty:
+        return np.zeros(len(ends)), np.zeros(len(ends)), np.zeros(len(ends), bool)
+
+    tz = ends.tz
+    # daily total, interval-ending at the end of its calendar day
+    day_end = pd.DatetimeIndex(
+        [pd.Timestamp(d) + pd.Timedelta("1D") for d in de["date"]])
+    if tz is not None:
+        day_end = day_end.tz_localize(tz)
+    et0_day = pd.Series(de["et0"].to_numpy(float), index=day_end)
+    eto_day = pd.Series(de["eto"].to_numpy(float), index=day_end)
+
+    if dt_is_subdaily:
+        shape = _clearsky_shape(timeline, lat, lon, tz_meridian)
+        et0_s = disaggregate(et0_day, timeline, shape=shape, step="1D")
+        eto_s = disaggregate(eto_day, timeline, shape=shape, step="1D")
+        e0 = et0_s.to_numpy(float)
+        eo = eto_s.to_numpy(float)
+    else:
+        # daily Dt: each step carries the total for the day it covers
+        covered = pd.Index((ends - timeline.dt).date)
+        by_date_et0 = {d.date(): v for d, v in zip(day_end - pd.Timedelta("1D"),
+                                                   et0_day.to_numpy())}
+        by_date_eto = {d.date(): v for d, v in zip(day_end - pd.Timedelta("1D"),
+                                                   eto_day.to_numpy())}
+        e0 = np.array([by_date_et0.get(d, np.nan) for d in covered])
+        eo = np.array([by_date_eto.get(d, np.nan) for d in covered])
+
+    ok = np.isfinite(e0)
+    return np.nan_to_num(e0, nan=0.0), np.nan_to_num(eo, nan=0.0), ok
 
 
 def _cli(argv=None):

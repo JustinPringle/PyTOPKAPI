@@ -300,6 +300,11 @@ measurements.csv ─▶ readings (n_t × n_gauges)┘
 build `W`, interpolate, and write `rainfields.h5` with the cell-order guard
 armed — and drops a `forcing_manifest.json` beside it.
 
+The field-builder has two subcommands: **`rain`** (this section) and **`et`**
+(§5.4). A bare `python -m topkapi_setup.forcing …` still means `rain`, so the
+commands below are unchanged; `python -m topkapi_setup.forcing rain …` is the
+explicit form.
+
 ```bash
 python -m topkapi_setup.forcing \
     --manifest     projects/umhlanga/forcing/gauge_manifest.csv \
@@ -887,6 +892,13 @@ record lands as NaN rather than a fake extreme. The sentinel rules are the
 per-variable `QA_RULES` in `met.py` — override them there if a station needs a
 tighter range.
 
+**Two reductions, not one.** The CLI above writes the *daily* table
+(`daily_table`), the FAO-56 daily input. `met` also carries `step_table`, which
+aggregates the same cleaned readings straight onto the model `Timeline` — one
+row per station per `Dt` step, the input for hourly Penman-Monteith. You do not
+call it directly: `penman` (§5.3) picks the reduction from the data resolution,
+below.
+
 ### 5.3 Reference and open-water ET — `penman`
 
 Turns the daily table into the two demand fields the solver reads: `ET0` (`ETr`,
@@ -914,18 +926,85 @@ elevation from its `elevation_m` — both feed the radiation and pressure terms.
 | `--method` | `auto` | `auto` (Penman-Monteith where data allow, else Hargreaves) or `hargreaves` to force temperature-only |
 | `--out` | none | write the per-station-day ET0/ETo CSV |
 
-Two things worth a glance. **`ET0` is mm/day here** — the split into mm-per-`Dt`
-depths, weighted by clear-sky radiation so evaporation follows the sun, is the
-disaggregation step that the ET.h5 writer owns, not this one. And **Hargreaves
-is temperature-driven**, so a stuck-high `tmax` inflates it directly (a 48 °C
-sensor day gives a ~10 mm/day ET0 that is not real); tighten the temperature
-ceiling in `met`'s `QA_RULES`, or lean on Penman-Monteith, which is
-radiation-driven and less hostage to a bad `tmax`. The everyday FAO-56 formulas
-live as pure functions in `penman.py`, checked against the FAO-56 worked example
-(ET0 = 3.9 mm/day), for when you want them from a notebook.
+Two things worth a glance. **`ET0` is mm/day here** — this CLI reports the daily
+figure. And **Hargreaves is temperature-driven**, so a stuck-high `tmax`
+inflates it directly (a 48 °C sensor day gives a ~10 mm/day ET0 that is not
+real); tighten the temperature ceiling in `met`'s `QA_RULES`, or lean on
+Penman-Monteith, which is radiation-driven and less hostage to a bad `tmax`. The
+everyday FAO-56 formulas live as pure functions in `penman.py`, checked against
+the FAO-56 worked example (ET0 = 3.9 mm/day), for when you want them from a
+notebook.
 
-*Still to land in the ET stage: the clear-sky diurnal disaggregation and the
-`(n_t, n_cells)` writer to `ET.h5` (with the same cell-order guard as §4.6).*
+#### Resolution: use the sub-daily feed, or disaggregate a daily one
+
+The daily CLI above is the report; `et0_eto_on_clock` is what the ET.h5 writer
+actually calls, and it does **not** always go through a daily total. The
+eThekwini network reports every half hour, and throwing that away to compute a
+daily ET0 and smear it back over the hours by a fixed clear-sky shape would
+erase the real diurnal signal — a January afternoon of convective cloud that
+collapses the measured radiation shows up in the data but not in a clear-sky
+curve. So the routine decides, **per station**, from the native sampling step
+against the model `Dt`:
+
+| Native step vs `Dt` | What runs | Disaggregation |
+|---|---|---|
+| `native ≤ Dt`, `Dt` sub-daily | hourly Penman-Monteith at `Dt` (Allen 2006: `Cn=37`, day/night `Cd` and soil-heat-flux), from `met.step_table` | none — the feed is used as measured |
+| `native ≤ Dt`, `Dt` daily | daily Penman-Monteith | none |
+| `native > Dt`, `Dt` sub-daily | daily Penman-Monteith, then split across the hours by the clear-sky solar shape | **yes — the only path that disaggregates** |
+| `Dt` daily | daily Penman-Monteith mapped to each daily step | none |
+
+So the daily-total-then-disaggregate path fires only when the input is genuinely
+coarser than the model *and* the model is sub-daily — a daily SAWS record under
+an hourly run. Given a sub-daily feed, hourly Penman-Monteith uses the measured
+radiation, temperature, humidity and wind at each step, and a run of steps sums
+to the day's ET with no separate disaggregation. On the sub-daily path,
+open-water `ETo` is the hourly `ETr` scaled by that day's `E0/ET0` ratio from
+the daily Penman open-water, so the sub-percent channel term stays consistent
+with the daily path and falls back to `ETo = ETr` on temperature-only days. Both
+paths ride the one `Timeline`, and the per-`Dt` depths are in **mm per step**,
+the unit `ET.h5` wants.
+
+*Still to land in the ET stage: nothing new here — the `(n_t, n_cells)` writer
+to `ET.h5` (with the §4.6 cell-order guard) is delivered as its own patch
+(`etfields`), and it consumes exactly the per-step `ETr`/`ETo` readings this
+router returns.*
+
+### 5.4 Build `ET.h5` end to end — `forcing et`
+
+The ET twin of §4: weather manifest + measurements in, `ET.h5` (`ETr` + `ETo`)
+out, with the cell-order guard armed and provenance merged into the shared
+`forcing_manifest.json` under an `"et"` key (the rainfall section is left
+intact). It resolution-routes internally (§5.3), so a sub-daily feed is used at
+the model step and only a daily feed is disaggregated — you do not choose.
+
+```bash
+python -m topkapi_setup.forcing et \
+    --manifest     projects/umhlanga/forcing/weather_manifest.csv \
+    --measurements projects/umhlanga/forcing/weather_measurements.csv \
+    --mask         projects/umhlanga/terrain/mask.tif \
+    --cell-param   projects/umhlanga/cell_param.dat \
+    --start "2025-01-01 01:00" --end "2025-02-01 00:00" --dt 3600 \
+    --tz Africa/Johannesburg --tz-meridian 30 \
+    --method idw --group ohlanga_jan2025 \
+    --out projects/umhlanga/forcing/ET.h5
+```
+
+Every clock and interpolation flag matches `rain` (same `W`, same guard, same
+`--trim`/`--buffer-km`/`--min-coverage`); the ET-only flags are:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--et-method` | `auto` | `auto` (Penman–Monteith where data allow, else Hargreaves) or `hargreaves` to force temperature-only |
+| `--wind-height` | `2.0` | anemometer height (m) for the 2 m adjustment; set `10` for a typical AWS once confirmed |
+| `--tz-meridian` | none | standard-meridian longitude of the clock (`30` for SAST); only nudges the clear-sky disaggregation shape, so it matters only on the daily-input path |
+
+The run prints steps × cells, stations used, the **resolution path per station**
+(so you can see the sub-daily feed being used directly, not smeared from a daily
+total), coverage, and a day-mean-vs-night-mean line — ET should breathe with the
+sun, near zero at night. If a step has *no* station reporting at all, it refuses
+rather than zero-fill: loosen `--min-coverage`, add `--trim`, or fill the gap (gap-filling is
+the subject of its own design note — reanalysis backfill, a neighbour-station
+regression, or a diurnal-climatology fill).
 
 ---
 ## Writing new stages
@@ -954,6 +1033,6 @@ A module is not "done" until (1)–(5) hold and the suite is green.
 | M1 | preflight / terrain / viz | `preflight`, `terrain`, `viz` | done |
 | M2 | parameter rasters | `params`, `soil_table` | done |
 | M3 | forcing builder (rainfall) | `forcing`, `forcing.sources.*` | done |
-| M3 | forcing builder (ET) | `met`, `penman`, `forcing.sources.weather_*` | sources/met/penman done; ET.h5 writer to do |
+| M3 | forcing builder (ET) | `met`, `penman`, `forcing.sources.weather_*` | sources/met/penman + resolution routing done; ET.h5 writer ships as `etfields` patch |
 | M4 | config + run (`--check`) | `config`, `run` | to do |
 | M5 | calibration | `calibrate` | to do |

@@ -171,3 +171,116 @@ def test_reference_et0_nan_without_temperature():
                      "elevation_m": 50.0, "date": pd.Timestamp("2025-01-15")})
     et0, method = pm.reference_et0(row, latitude=-29.8)
     assert np.isnan(et0) and method == "none"
+
+
+# --------------------------------------------------------------------------
+# Sub-daily / hourly FAO-56 (Allen 2006), anchored to FAO-56 Example 19
+# (N'Diaye, Senegal; 1 Oct, hour 14:00-15:00): T=38 C, RH=52%, u2=3.3 m/s,
+# Rs=2.45 MJ/m^2/h -> ETo ~ 0.63 mm/h.  Nighttime 02:00-03:00 (Rs=0) -> ~0.
+# --------------------------------------------------------------------------
+
+def _ex19_fcd():
+    # cloudiness from the hour's own Rs/Rso (single-hour anchor); the routing
+    # driver uses the daily total instead, but for one clear hour this matches.
+    ra = pm.extraterrestrial_radiation_hourly(16.22, -16.25, 274, 14.5, 1.0,
+                                              tz_meridian=0.0)
+    rso = pm.clear_sky_radiation(ra, 8.0)
+    return float(np.clip(1.35 * min(2.45 / rso, 1.0) - 0.35, 0.05, 1.0))
+
+
+def test_hourly_pm_matches_fao_example19_daytime():
+    es = pm.svp(38.0)
+    ea = 0.52 * es
+    rs_rate = pm.rs_rate_from_wm2(2.45 / 0.0036)      # 2.45 MJ/m^2/h -> W/m^2 -> rate
+    et = float(pm.et0_penman_monteith_hourly(38.0, rs_rate, 3.3, ea, 8.0,
+                                             _ex19_fcd(), period_hours=1.0))
+    assert et == pytest.approx(0.63, abs=0.06)        # published worked example
+    assert et == pytest.approx(0.6641, abs=1e-3)      # frozen regression
+
+
+def test_hourly_pm_night_is_essentially_zero():
+    es = pm.svp(28.0)
+    ea = 0.90 * es
+    et = float(pm.et0_penman_monteith_hourly(28.0, 0.0, 1.9, ea, 8.0,
+                                             fcd=0.66, period_hours=1.0))
+    assert 0.0 <= et < 0.02
+
+
+def test_hourly_extraterrestrial_is_zero_at_night_positive_at_noon():
+    ra_night = pm.extraterrestrial_radiation_hourly(-29.7, 31.0, 15, 2.5)
+    ra_noon = pm.extraterrestrial_radiation_hourly(-29.7, 31.0, 15, 12.0)
+    assert ra_night == pytest.approx(0.0, abs=1e-9)
+    assert ra_noon > 3.0
+
+
+def test_combine_daily_defaults_unchanged():
+    # the generalised equation must still reproduce the daily worked example
+    et = pm.penman_monteith_combine(0.122, 13.28, 0.0, 0.0666, 16.9, 2.078, 0.589)
+    assert float(et) == pytest.approx(3.88, abs=0.02)
+
+
+# --------------------------------------------------------------------------
+# Resolution routing: et0_eto_on_clock
+# --------------------------------------------------------------------------
+
+def _manifest(sids):
+    from pyproj import Transformer
+    tx = Transformer.from_crs("EPSG:4326", "EPSG:32736", always_xy=True)
+    rows = []
+    for sid in sids:
+        x, y = tx.transform(31.05, -29.72)
+        rows.append({"station_id": sid, "x": x, "y": y,
+                     "crs": "EPSG:32736", "elevation_m": 40.0})
+    return pd.DataFrame(rows).set_index("station_id")
+
+
+def _subdaily_clean(sid, day="2025-01-02", step_min=30):
+    """A full clear-ish summer day of sub-daily met for one station."""
+    t = pd.date_range(f"{day} 00:00", f"{day} 23:59", freq=f"{step_min}min")
+    h = t.hour + t.minute / 60.0
+    solar = np.clip(800.0 * np.sin(np.pi * (h - 6) / 12.0), 0, None)  # daylit bump
+    temp = 20.0 + 6.0 * np.sin(np.pi * (h - 8) / 12.0)
+    rows = []
+    for var, vals in {"temp": temp, "rh": np.full_like(h, 65.0),
+                      "wind": np.full_like(h, 2.0), "solar": solar}.items():
+        rows.append(pd.DataFrame({"datetime": t, "station_id": sid,
+                                  "variable": var, "value": vals}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def test_router_takes_subdaily_path_and_gives_diurnal_et():
+    from topkapi_setup.forcing.gauges import Timeline
+    clean = _subdaily_clean("A", step_min=30)
+    man = _manifest(["A"])
+    tl = Timeline("2025-01-02 01:00", "2025-01-03 00:00", 3600)  # hourly day
+    et0, eto, avail, report = pm.et0_eto_on_clock(clean, man, tl)
+
+    assert report.loc[0, "path"] == "subdaily"
+    s = pd.Series(et0[:, 0], index=tl.times)
+    assert s[np.isin(tl.times.hour, [0, 1, 2, 3])].max() < 0.03   # night ~ 0
+    assert s[np.isin(tl.times.hour, [11, 12, 13])].max() > 0.1    # midday peak
+    assert 1.0 < float(s.sum()) < 9.0                            # sane daily mm
+    assert (eto[:, 0] >= et0[:, 0] - 1e-9).all()                 # open water >= ref
+
+
+def test_router_disaggregates_only_daily_input_under_subdaily_model():
+    from topkapi_setup.forcing.gauges import Timeline
+    # DAILY input: one reading per variable per day (native step = 1 day), so
+    # under an hourly model this is the sole disaggregation path.
+    rows = []
+    for d in ["2025-01-02", "2025-01-03", "2025-01-04"]:
+        for var, val in {"temp": 24.0, "rh": 60.0, "wind": 2.0,
+                         "solar": 300.0}.items():
+            rows.append({"datetime": pd.Timestamp(f"{d} 12:00"),
+                         "station_id": "D", "variable": var, "value": val})
+    clean = pd.DataFrame(rows)
+    man = _manifest(["D"])
+
+    tl = Timeline("2025-01-02 01:00", "2025-01-03 00:00", 3600)   # hourly model
+    et0, eto, avail, report = pm.et0_eto_on_clock(clean, man, tl)
+    assert report.loc[0, "path"] == "daily->disaggregated"
+    s = pd.Series(et0[:, 0], index=tl.times)
+    assert float(s.sum()) > 0.0                                    # a real total
+    # shaped by the clear-sky sun: midday carries more than the dead of night
+    assert s[np.isin(tl.times.hour, [11, 12, 13])].max() > \
+           s[np.isin(tl.times.hour, [0, 1, 2, 3])].max()

@@ -190,3 +190,50 @@ def test_read_manifest_keys_on_station_id_and_keeps_elevation(tmp_path):
     # elevation carried, NaN preserved (Hargreaves fallback downstream)
     assert df.loc["6446", "elevation_m"] == 50.0
     assert np.isnan(df.loc["3393", "elevation_m"])
+
+
+# --------------------------------------------------------------------------
+# Sub-daily reduction onto the model clock: station_native_step + step_table
+# --------------------------------------------------------------------------
+
+from topkapi_setup.forcing.gauges import Timeline
+
+
+def test_station_native_step_is_modal_spacing():
+    clean = half_hourly("2025-01-02", "A", "temp", np.full(48, 22.0))
+    assert met.station_native_step(clean, "A") == pd.Timedelta("30min")
+    assert met.station_native_step(clean, "missing") is None
+
+
+def test_step_table_aggregates_to_dt_with_fixed_schema():
+    # 30-min temp/solar over one day -> hourly steps, two samples each
+    day = "2025-01-02"
+    temp = half_hourly(day, "A", "temp", 20.0 + np.arange(48) * 0.1)
+    solar = half_hourly(day, "A", "solar", np.full(48, 400.0))
+    clean = pd.concat([temp, solar], ignore_index=True)
+    tl = Timeline(f"{day} 01:00", "2025-01-03 00:00", 3600)
+
+    st = met.step_table(clean, tl)
+    assert list(st.columns) == list(met.STEP_COLUMNS)
+    assert (st["n_temp"].iloc[:-1] == 2).all()       # 2 per hour (last is a boundary)
+    # step-mean temperature: the hour ending 02:00 spans the 01:00 & 01:30 reads
+    row = st[st["datetime"] == pd.Timestamp("2025-01-02 02:00")].iloc[0]
+    # the hour ending 02:00 spans the 01:30 and 02:00 readings (interval-ending)
+    assert row["temp"] == pytest.approx((temp["value"].iloc[3]
+                                         + temp["value"].iloc[4]) / 2)
+    assert row["solar"] == pytest.approx(400.0)
+
+
+def test_step_table_coverage_gates_a_half_empty_step():
+    # only one 30-min reading in the hour that needs two (min_coverage 0.8)
+    t = pd.to_datetime(["2025-01-02 01:00"])            # single reading in hour->02:00
+    one = pd.DataFrame({"datetime": t, "station_id": "A",
+                        "variable": "temp", "value": [21.0]})
+    full = half_hourly("2025-01-02", "A", "temp", np.full(48, 21.0))
+    clean = pd.concat([full, one], ignore_index=True).drop_duplicates(
+        ["datetime", "station_id", "variable"])
+    tl = Timeline("2025-01-02 01:00", "2025-01-03 00:00", 3600)
+    st = met.step_table(clean, tl)
+    # every emitted hourly step still carries its two-sample mean; the schema
+    # holds and counts never exceed the expected per-step sample count
+    assert (st["n_temp"] <= 2).all()

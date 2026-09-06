@@ -71,10 +71,13 @@ __all__ = [
     "QA_RULES",
     "DEFAULT_MIN_COVERAGE",
     "DAILY_COLUMNS",
+    "STEP_COLUMNS",
     "read_manifest",
     "read_measurements",
     "clean_measurements",
     "daily_table",
+    "station_native_step",
+    "step_table",
     "coverage",
 ]
 
@@ -147,6 +150,19 @@ DEFAULT_MIN_COVERAGE = 0.8
 DAILY_COLUMNS = (
     "station_id", "date",
     "tmax", "tmin", "tmean", "n_temp",
+    "wind", "n_wind",
+    "solar", "n_solar",
+    "rh", "n_rh",
+    "tdew", "n_tdew",
+)
+
+#: Fixed per-step (sub-daily) schema for the "use it explicitly" path.  One row
+#: per station per model step; ``temp`` is the step-mean temperature (hourly
+#: Penman-Monteith uses e0 at the step's own T, not a Tmax/Tmin mean), the rest
+#: are step means in their feed units (``solar`` still W/m^2; penman converts).
+STEP_COLUMNS = (
+    "station_id", "datetime",
+    "temp", "n_temp",
     "wind", "n_wind",
     "solar", "n_solar",
     "rh", "n_rh",
@@ -392,6 +408,105 @@ def _expected_per_day(step: pd.Timedelta | None) -> int:
     if step is None or step <= pd.Timedelta(0):
         return 1
     return max(1, int(round(pd.Timedelta("1D") / step)))
+
+
+# ---------------------------------------------------------------------------
+# Sub-daily reduction: put the feed on the model clock (the "use it explicitly"
+# path). This is to daily_table what gauges.aggregate is to a daily rain total:
+# when the met feed is at least as fine as Dt, the model step is filled from the
+# readings that fall in it, and penman computes ET there -- no daily detour.
+# ---------------------------------------------------------------------------
+
+# variable -> (step column, count column). temp yields one step-mean here (not
+# tmax/tmin): hourly Penman-Monteith wants the step's own temperature.
+_STEP_VARS = {
+    "temp": ("temp", "n_temp"),
+    "wind": ("wind", "n_wind"),
+    "solar": ("solar", "n_solar"),
+    "rh": ("rh", "n_rh"),
+    "tdew": ("tdew", "n_tdew"),
+}
+
+
+def station_native_step(clean: pd.DataFrame, station_id) -> pd.Timedelta | None:
+    """Modal sampling step of one station's readings, or ``None`` if <2 stamps.
+
+    This is the number the resolution decision turns on: a station whose native
+    step is at or finer than ``Dt`` is computed directly at ``Dt``; a coarser
+    one (a daily record under an hourly run) goes daily-then-disaggregate.
+    """
+    block = clean[clean["station_id"] == str(station_id)]
+    if block.empty:
+        return None
+    return native_step(pd.DatetimeIndex(block["datetime"]))
+
+
+def step_table(clean: pd.DataFrame, timeline: Timeline,
+               min_coverage: float = DEFAULT_MIN_COVERAGE) -> pd.DataFrame:
+    """Aggregate cleaned sub-daily readings onto the model ``timeline`` steps.
+
+    One row per station per step, on the timeline's interval-ending convention:
+    a reading at ``tau`` fills the step ending at the first stamp ``>= tau``
+    (and after that step's start).  A step is emitted for a variable only when
+    it holds at least ``min_coverage`` of the native readings it should
+    (``Dt / native_step``), so a half-empty hour lands as NaN rather than a
+    biased mean.  Returns the fixed :data:`STEP_COLUMNS` schema, ready for the
+    hourly Penman-Monteith path in :func:`penman.et0_eto_on_clock`.
+    """
+    if clean.empty:
+        return pd.DataFrame(columns=list(STEP_COLUMNS))
+
+    ends = timeline.times
+    dt = timeline.dt
+    rows = []
+
+    for sid, block in clean.groupby("station_id", sort=True):
+        stamps = pd.DatetimeIndex(block["datetime"])
+        native = native_step(stamps)
+        expected = 1 if native is None or native >= dt else int(round(dt / native))
+        min_n = max(1, int(np.ceil(min_coverage * expected))) if expected > 1 else 1
+
+        # Which step each reading falls in (first end >= tau, and tau > end-Dt).
+        pos = np.searchsorted(ends.asi8, stamps.asi8, side="left")
+        inside = pos < len(ends)
+        within = np.zeros(len(stamps), dtype=bool)
+        within[inside] = stamps[inside].asi8 > (ends[pos[inside]] - dt).asi8
+        block = block.assign(_step=np.where(within, pos, -1))
+        block = block[block["_step"] >= 0]
+        if block.empty:
+            continue
+
+        per_step = {}
+        for var, (col, ncol) in _STEP_VARS.items():
+            sub = block[block["variable"] == var]
+            if sub.empty:
+                continue
+            grp = sub.groupby("_step")["value"]
+            mean = grp.mean()
+            count = grp.size()
+            for step_i, n in count.items():
+                rec = per_step.setdefault(step_i, {})
+                rec[ncol] = int(n)
+                if n >= min_n:
+                    rec[col] = float(mean.loc[step_i])
+
+        for step_i, rec in per_step.items():
+            row = {c: np.nan for c in STEP_COLUMNS}
+            row["station_id"] = sid
+            row["datetime"] = ends[step_i]
+            row.update(rec)
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=list(STEP_COLUMNS))
+    out = pd.DataFrame(rows)
+    for col in STEP_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+    out = out[list(STEP_COLUMNS)]
+    for ncol in ("n_temp", "n_wind", "n_solar", "n_rh", "n_tdew"):
+        out[ncol] = out[ncol].fillna(0).astype(int)
+    return out.sort_values(["station_id", "datetime"], ignore_index=True)
 
 
 # ---------------------------------------------------------------------------

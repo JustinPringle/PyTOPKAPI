@@ -34,6 +34,12 @@ from topkapi_setup.forcing.rainfields import (  # noqa: F401
     read_rainfields,
     write_rainfields,
 )
+from topkapi_setup.forcing.etfields import (  # noqa: F401
+    build_and_write_etfields,
+    build_etfields,
+    read_etfields,
+    write_etfields,
+)
 from topkapi_setup.forcing.interpolate import (  # noqa: F401
     DEFAULT_BUFFER_M,
     DEFAULT_IDW_POWER,
