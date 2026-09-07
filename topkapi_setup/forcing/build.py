@@ -49,10 +49,16 @@ import numpy as np
 from topkapi_setup.forcing import gauges as gg
 from topkapi_setup.forcing import interpolate as ip
 from topkapi_setup.forcing import rainfields as rf
+from topkapi_setup.forcing import met as mt
+from topkapi_setup.forcing import penman as pnm
+from topkapi_setup.forcing import etfields as ef
+from topkapi_setup.forcing import gapfill as gf
 
 __all__ = [
     "ForcingResult",
     "build_rainfields",
+    "ETResult",
+    "build_etfields",
     "main",
 ]
 
@@ -391,6 +397,240 @@ def _jsonable(kwargs):
 
 
 # ---------------------------------------------------------------------------
+# ET path: the same shape as the rainfall build, computing ETr/ETo per station
+# on the clock (resolution-routed in penman.et0_eto_on_clock) and spreading them
+# with the same W. Writes ET.h5 and merges its provenance into the shared
+# forcing_manifest.json under an "et" section.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ETResult:
+    """Paths and metadata emitted by :func:`build_etfields`."""
+
+    et: str
+    manifest_json: str
+    group: str
+    mask: str
+    cell_param: str | None
+    crs: str
+    n_cells: int
+    n_stations_manifest: int
+    n_stations_used: int
+    stations_used: list[str]
+    paths: dict            # per-station resolution path (subdaily / daily / ...)
+    method: str
+    method_params: dict
+    timeline: dict
+    coverage: dict
+    field_stats: dict
+    sources: dict
+    gap_fill: dict = field(default_factory=dict)
+    created: str = field(default_factory=lambda: _dt.datetime.now().isoformat(timespec="seconds"))
+
+    def to_json(self, path) -> None:
+        """Merge under the ``"et"`` key, leaving any rainfall section intact."""
+        p = Path(path)
+        data = {}
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+            except json.JSONDecodeError:
+                data = {}
+        data["et"] = asdict(self)
+        p.write_text(json.dumps(data, indent=2))
+
+
+def build_etfields(
+    manifest_path,
+    measurements_path,
+    mask_path,
+    out_path,
+    *,
+    start,
+    end,
+    dt_seconds: int,
+    group_name: str = ef.DEFAULT_GROUP,
+    cell_param_path=None,
+    method: str = ip.DEFAULT_METHOD,
+    tz: str | None = None,
+    tz_meridian: float | None = None,
+    target_crs: str = gg.DEFAULT_CRS,
+    buffer_m: float | None = None,
+    idw_power: float = ip.DEFAULT_IDW_POWER,
+    n_nearest: int | None = None,
+    variogram_model: str = "spherical",
+    range_m: float | None = None,
+    sill: float | None = None,
+    et_method: str = "auto",
+    wind_height: float = 2.0,
+    gap_fill: bool = True,
+    max_interp_gap: int = gf.DEFAULT_MAX_INTERP_GAP,
+    min_coverage: float = mt.DEFAULT_MIN_COVERAGE,
+    block_size: int = 720,
+    compression: str | None = None,
+    renormalise_gaps: bool = True,
+    check_cell_order: bool = True,
+    trim: bool = False,
+) -> ETResult:
+    """Build ``ET.h5`` (``ETr`` + ``ETo``) end to end and record provenance.
+
+    The ET twin of :func:`build_rainfields`.  It reads the weather manifest and
+    measurements, computes per-station ``ETr``/``ETo`` on the clock -- routed by
+    data resolution in :func:`penman.et0_eto_on_clock`, so a sub-daily feed is
+    used directly and only a daily feed is disaggregated -- and spreads them onto
+    the grid with the same ``W`` the rainfall side uses.  Every knob mirrors the
+    rainfall builder; the ET-specific ones are ``et_method`` (``auto`` or
+    ``hargreaves``), ``wind_height`` (anemometer height for the 2 m adjustment)
+    and ``tz_meridian`` (the clock's standard meridian, only nudging the
+    clear-sky disaggregation shape).
+    """
+    if method not in ip.METHODS:
+        raise ValueError(
+            f"unknown method {method!r}; choose one of {', '.join(ip.METHODS)}"
+        )
+
+    manifest_path = str(manifest_path)
+    measurements_path = str(measurements_path)
+    mask_path = str(mask_path)
+    out_path = Path(out_path)
+
+    # 1. Stations + measurements, cleaned of the feed's in-band sentinels.
+    man = mt.read_manifest(manifest_path, target_crs=target_crs)
+    meas = mt.read_measurements(measurements_path, tz=tz)
+    clean, _qc = mt.clean_measurements(meas)
+
+    # 2. The one clock, shared with rainfall.
+    timeline = gg.Timeline(start, end, dt_seconds=dt_seconds, tz=tz)
+
+    # 3. ETr/ETo per station on the clock -- resolution decided per station.
+    etr, eto, available, report = pnm.et0_eto_on_clock(
+        clean, man, timeline, method=et_method, wind_height=wind_height,
+        tz_meridian=tz_meridian, min_coverage=min_coverage,
+    )
+    paths = dict(zip(report["station_id"], report["path"]))
+
+    # 3b. Tier-2 temporal fill: patch each station's own series in time (short
+    #     holes linearly, long ones by its diurnal climatology) so a step where
+    #     every station is out still carries values. Tier 1 (lean on the
+    #     neighbours) is the spatial renormalise the writer already does.
+    n_gap_filled = 0
+    if gap_fill:
+        orig_available = available          # etr and eto share the same gaps
+        etr, available, n_gap_filled = gf.fill_readings_in_time(
+            etr, orig_available, timeline, max_interp_gap=max_interp_gap)
+        eto, _, _ = gf.fill_readings_in_time(
+            eto, orig_available, timeline, max_interp_gap=max_interp_gap)
+
+    # 3a. Refuse (or trim) a window the network can't cover, before the geometry.
+    #     Reuse the rainfall guard on ETr; mirror any trim onto ETo.
+    orig_times = timeline.times
+    timeline, etr, available = _cover_or_trim(
+        timeline, etr, available, clean, trim=trim,
+    )
+    if timeline.n_t != len(orig_times):
+        eto = eto[orig_times.isin(timeline.times)]
+
+    # 4. Geometry: cells canonical, stations in manifest order.
+    cell_xy = np.column_stack(ip.catchment_cell_xy(mask_path))
+    station_xy = man[["x", "y"]].to_numpy(float)
+    station_ids = [str(s) for s in man.index]
+
+    if buffer_m is not None:
+        keep = ip.select_gauges(station_xy, cell_xy, buffer_m=buffer_m)
+        station_xy = station_xy[keep]
+        etr = etr[:, keep]
+        eto = eto[:, keep]
+        available = available[:, keep]
+        station_ids = [station_ids[i] for i in keep]
+        paths = {s: paths.get(s) for s in station_ids}
+
+    # 5. Method kwargs (kriging fits on ETr) then W.
+    method_params = _method_kwargs(
+        method, etr, available,
+        idw_power=idw_power, n_nearest=n_nearest,
+        variogram_model=variogram_model, range_m=range_m, sill=sill,
+    )
+    W = ip.build_weights(cell_xy, station_xy, method=method, **method_params)
+
+    # 6. ETr + ETo to ET.h5, streamed in time blocks, guard armed by default.
+    guard = check_cell_order and cell_param_path is not None
+    ef.build_and_write_etfields(
+        out_path, W, etr, eto, available,
+        group_name=group_name,
+        mask_path=mask_path if guard else None,
+        cell_param_path=str(cell_param_path) if guard else None,
+        timeline=timeline, block_size=block_size, compression=compression,
+        renormalise_gaps=renormalise_gaps,
+    )
+
+    # 7. Provenance, merged into the shared manifest.
+    cov = gg.coverage(available, station_ids, timeline)
+    result = ETResult(
+        et=str(out_path),
+        manifest_json=str(out_path.parent / MANIFEST_NAME),
+        group=group_name,
+        mask=mask_path,
+        cell_param=str(cell_param_path) if cell_param_path is not None else None,
+        crs=str(target_crs),
+        n_cells=len(cell_xy),
+        n_stations_manifest=len(man),
+        n_stations_used=len(station_ids),
+        stations_used=station_ids,
+        paths=paths,
+        method=method,
+        method_params=_jsonable(method_params),
+        timeline={
+            "start": str(timeline.times[0]),
+            "end": str(timeline.times[-1]),
+            "dt_seconds": int(timeline.dt_seconds),
+            "tz": tz,
+            "n_t": int(timeline.n_t),
+        },
+        coverage={
+            "min": float(cov["fraction"].min()),
+            "median": float(cov["fraction"].median()),
+            "max": float(cov["fraction"].max()),
+            "per_station": {s: float(f) for s, f in cov["fraction"].items()},
+        },
+        field_stats=_et_field_summary(out_path, group_name, timeline),
+        sources={"manifest": manifest_path, "measurements": measurements_path},
+        gap_fill={"enabled": bool(gap_fill),
+                  "max_interp_gap": int(max_interp_gap) if gap_fill else None,
+                  "station_steps_filled": int(n_gap_filled)},
+    )
+    result.to_json(result.manifest_json)
+    return result
+
+
+def _et_field_summary(path, group_name, timeline):
+    """Peak/mean ETr and a day/night ratio -- the ET should breathe with the sun."""
+    with h5py.File(path, "r") as h5:
+        etr = h5[f"/{group_name}/ETr"]
+        n_t = etr.shape[0]
+        total = 0.0
+        peak = 0.0
+        row_mean = np.empty(n_t)
+        for s in range(0, n_t, _SUMMARY_BLOCK):
+            e = min(s + _SUMMARY_BLOCK, n_t)
+            block = etr[s:e]
+            total += float(block.sum())
+            peak = max(peak, float(block.max()))
+            row_mean[s:e] = block.mean(axis=1)
+            n_cells = block.shape[1]
+    hours = timeline.times.hour
+    day = np.isin(hours, range(9, 16))
+    night = np.isin(hours, [0, 1, 2, 3, 22, 23])
+    day_mean = float(row_mean[day].mean()) if day.any() else float("nan")
+    night_mean = float(row_mean[night].mean()) if night.any() else float("nan")
+    return {
+        "peak_cell_mm": peak,
+        "mean_mm": total / (n_t * n_cells) if n_t and n_cells else 0.0,
+        "day_mean_mm": day_mean,
+        "night_mean_mm": night_mean,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -398,7 +638,7 @@ def _build_arg_parser():
     import argparse
 
     p = argparse.ArgumentParser(
-        prog="python -m topkapi_setup.forcing",
+        prog="python -m topkapi_setup.forcing rain",
         description="Build rainfields.h5 from a gauge manifest and "
                     "measurements, and write forcing_manifest.json beside it.",
     )
@@ -461,7 +701,7 @@ def _build_arg_parser():
     return p
 
 
-def main(argv=None):
+def _run_rain(argv=None):
     args = _build_arg_parser().parse_args(argv)
     result = build_rainfields(
         args.manifest, args.measurements, args.mask, args.out,
@@ -496,6 +736,145 @@ def main(argv=None):
         print("  NOTE: cell-order guard OFF (no --cell-param); a permuted "
               "field would pass silently.")
     print(f"  manifest: {result.manifest_json}")
+
+
+def _build_et_arg_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python -m topkapi_setup.forcing et",
+        description="Build ET.h5 (ETr + ETo) from a weather manifest and "
+                    "measurements, resolution-routed, and merge provenance "
+                    "into forcing_manifest.json under 'et'.",
+    )
+    p.add_argument("--manifest", required=True,
+                   help="weather manifest CSV (station_id,x,y,crs,elevation_m,…)")
+    p.add_argument("--measurements", required=True,
+                   help="long measurements CSV (datetime,station_id,variable,value)")
+    p.add_argument("--mask", required=True,
+                   help="mask.tif from terrain.py (fixes cell order + CRS)")
+    p.add_argument("--out", required=True, help="output ET.h5 path")
+    p.add_argument("--cell-param", default=None,
+                   help="cell_param.dat; arms the cell-order guard (recommended)")
+
+    clk = p.add_argument_group("clock")
+    clk.add_argument("--start", required=True,
+                     help='first interval-ending stamp, e.g. "2025-01-01 01:00"')
+    clk.add_argument("--end", required=True, help='last stamp, e.g. "2025-02-01 00:00"')
+    clk.add_argument("--dt", type=int, default=3600, dest="dt_seconds",
+                     help="model timestep in seconds (must match global_param.dat)")
+    clk.add_argument("--tz", default=None,
+                     help="timezone for the clock and stamps, e.g. Africa/Johannesburg")
+    clk.add_argument("--tz-meridian", type=float, default=None,
+                     help="standard-meridian longitude of the clock (30 for SAST); "
+                          "only nudges the clear-sky disaggregation shape")
+
+    p.add_argument("--group", default=ef.DEFAULT_GROUP,
+                   help=f"HDF5 group name (default {ef.DEFAULT_GROUP})")
+
+    e = p.add_argument_group("ET method")
+    e.add_argument("--et-method", choices=["auto", "hargreaves"], default="auto",
+                   help="'auto' = Penman-Monteith where data allow, else "
+                        "Hargreaves; 'hargreaves' forces temperature-only")
+    e.add_argument("--wind-height", type=float, default=2.0,
+                   help="anemometer height (m) for the 2 m adjustment "
+                        "(default 2.0; set 10 for a typical AWS once confirmed)")
+    e.add_argument("--no-gap-fill", action="store_true",
+                   help="disable the tier-2 temporal fill (short holes linearly, "
+                        "long ones by diurnal climatology); gaps then lean only "
+                        "on the spatial renormalise, and an all-station-out step "
+                        "is refused")
+    e.add_argument("--max-interp-gap", type=int, default=gf.DEFAULT_MAX_INTERP_GAP,
+                   help="longest hole (steps) filled by linear interpolation "
+                        "before falling to the diurnal climatology")
+
+    m = p.add_argument_group("interpolation")
+    m.add_argument("--method", default=ip.DEFAULT_METHOD, choices=list(ip.METHODS),
+                   help=f"how W is filled (default {ip.DEFAULT_METHOD})")
+    m.add_argument("--idw-power", type=float, default=ip.DEFAULT_IDW_POWER,
+                   help="IDW distance power (idw only)")
+    m.add_argument("--n-nearest", type=int, default=None,
+                   help="use only the N nearest stations per cell (idw only)")
+    m.add_argument("--variogram", default="spherical", dest="variogram_model",
+                   help="variogram model (kriging only)")
+    m.add_argument("--range-km", type=float, default=None,
+                   help="variogram range in km (kriging; geometry-only model)")
+    m.add_argument("--sill", type=float, default=None,
+                   help="variogram sill (kriging; geometry-only model)")
+    m.add_argument("--buffer-km", type=float, default=None,
+                   help="keep only stations within this distance of the catchment")
+
+    a = p.add_argument_group("aggregation + writing")
+    a.add_argument("--min-coverage", type=float, default=mt.DEFAULT_MIN_COVERAGE,
+                   help="fraction of a step's expected readings a variable needs "
+                        "(loosen if the network drops out on the same steps)")
+    a.add_argument("--block-size", type=int, default=720,
+                   help="row-block for the streamed write")
+    a.add_argument("--compression", default=None,
+                   help="h5py compression, e.g. gzip")
+    a.add_argument("--no-guard", action="store_true",
+                   help="disable the cell-order guard (not recommended)")
+    a.add_argument("--trim", action="store_true",
+                   help="clip an over-long window to the covered span")
+    return p
+
+
+def _run_et(argv=None):
+    args = _build_et_arg_parser().parse_args(argv)
+    result = build_etfields(
+        args.manifest, args.measurements, args.mask, args.out,
+        start=args.start, end=args.end, dt_seconds=args.dt_seconds,
+        group_name=args.group, cell_param_path=args.cell_param,
+        method=args.method, tz=args.tz, tz_meridian=args.tz_meridian,
+        buffer_m=None if args.buffer_km is None else args.buffer_km * 1000,
+        idw_power=args.idw_power, n_nearest=args.n_nearest,
+        variogram_model=args.variogram_model,
+        range_m=None if args.range_km is None else args.range_km * 1000,
+        sill=args.sill, et_method=args.et_method, wind_height=args.wind_height,
+        gap_fill=not args.no_gap_fill, max_interp_gap=args.max_interp_gap,
+        min_coverage=args.min_coverage, block_size=args.block_size,
+        compression=args.compression, check_cell_order=not args.no_guard,
+        trim=args.trim,
+    )
+
+    tl = result.timeline
+    fs = result.field_stats
+    print(f"Wrote ET.h5: /{result.group}/ETr,ETo "
+          f"({tl['n_t']} steps × {result.n_cells} cells) -> {result.et}")
+    requested_n = gg.Timeline(args.start, args.end, dt_seconds=args.dt_seconds,
+                              tz=args.tz).n_t
+    if tl["n_t"] != requested_n:
+        print(f"  trimmed window to station coverage: {tl['start']} → {tl['end']}")
+    paths = ", ".join(f"{s}:{p}" for s, p in result.paths.items())
+    print(f"  stations: {result.n_stations_used} used of "
+          f"{result.n_stations_manifest}  |  method: {result.method}")
+    print(f"  ET resolution path per station: {paths}")
+    gfs = result.gap_fill
+    if gfs.get("enabled"):
+        print(f"  tier-2 temporal fill: {gfs['station_steps_filled']} station-steps "
+              f"patched in time (linear <= {gfs['max_interp_gap']} steps, else "
+              f"diurnal climatology)")
+    print(f"  coverage: {result.coverage['min']:.0%} min, "
+          f"{result.coverage['median']:.0%} median, "
+          f"{result.coverage['max']:.0%} max")
+    print(f"  peak {fs['peak_cell_mm']:.3f} mm/step; day-mean "
+          f"{fs['day_mean_mm']:.3f} vs night-mean {fs['night_mean_mm']:.3f} "
+          f"(ET should breathe with the sun)")
+    if not result.cell_param:
+        print("  NOTE: cell-order guard OFF (no --cell-param); a permuted "
+              "field would pass silently.")
+    print(f"  manifest: {result.manifest_json}")
+
+
+def main(argv=None):
+    """Dispatch ``rain`` / ``et``; a bare invocation still means ``rain``."""
+    import sys
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "et":
+        return _run_et(argv[1:])
+    if argv and argv[0] == "rain":
+        argv = argv[1:]
+    return _run_rain(argv)
 
 
 if __name__ == "__main__":

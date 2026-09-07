@@ -10,7 +10,8 @@ raw DEM ──preflight──▶ clean UTM36S DEM ──terrain──▶ mask/fl
                                                           │
                                               params ◀────┤ (snaps to the mask)
                                                           │
-                                             forcing ◀────┘ (same cell order)
+                              rainfall (§4) ◀─────────────┤ (same cell order)
+                                    ET (§5) ◀─────────────┘
                                                           │
                                               (M4) config + run …
 ```
@@ -299,6 +300,11 @@ measurements.csv ─▶ readings (n_t × n_gauges)┘
 build `W`, interpolate, and write `rainfields.h5` with the cell-order guard
 armed — and drops a `forcing_manifest.json` beside it.
 
+The field-builder has two subcommands: **`rain`** (this section) and **`et`**
+(§5.4). A bare `python -m topkapi_setup.forcing …` still means `rain`, so the
+commands below are unchanged; `python -m topkapi_setup.forcing rain …` is the
+explicit form.
+
 ```bash
 python -m topkapi_setup.forcing \
     --manifest     projects/umhlanga/forcing/gauge_manifest.csv \
@@ -367,6 +373,7 @@ python -m topkapi_setup.forcing.sources.gauge_manifest \
     --out     projects/umhlanga/forcing/gauge_manifest.csv \
     --buffer-km 20
 ```
+
 
 `--network` is the FEWS station dump saved verbatim (the API returns a
 Python-literal string, not strict JSON; both parse). `--mask` is the `terrain.py`
@@ -734,6 +741,272 @@ is the isohyetal check the design note describes — a faithful contour reading 
 the IDW surface, without a separate code path.
 
 ---
+
+## 5. Build the ET forcing  —  `met` + `penman`  (M3)
+
+Produces the two demand fields the solver reads from `ET.h5`: `ETr`
+(reference-crop ET, grass) and `ETo` (open-water evaporation), each shaped
+`(n_timesteps, n_cells)` in the **same cell order** as `cell_param.dat`. Three
+stages: source the weather stations (5.1), clean and daily-reduce the record
+(5.2), then compute ET0/E0 (5.3). The weather pair mirrors the rainfall pair in
+§4.1 exactly, on the same `Timeline`.
+
+### 5.1 Sourcing weather stations from eThekwini FEWS
+
+The ET stage needs a weather manifest and a long measurements file, the ET twins
+of the rainfall pair in 4.1. Two adapters under `topkapi_setup/forcing/sources/`
+build them from the same eThekwini FEWS network. Both are thin CLIs; run them in
+order.
+
+```
+/stations ──weather_manifest──▶ weather_manifest.csv ──weather_measurements──▶ weather_measurements.csv
+```
+
+**Scope the network to the catchment — `weather_manifest`.** Fetches the live
+station list (or reads a saved dump), keeps stations that carry a `weather`
+device and fall within a buffer of the catchment, samples each station's
+elevation from the DEM, and writes the manifest.
+
+```bash
+export ETHEKWINI_FEWS_KEY=…            # Authorization header, never the URL
+python -m topkapi_setup.forcing.sources.weather_manifest \
+    --mask projects/umhlanga/terrain/mask.tif \
+    --dem  projects/umhlanga/terrain/dem_utm36s.tif \
+    --out  projects/umhlanga/forcing/weather_manifest.csv \
+    --buffer-km 20
+```
+
+`--network` is optional: omit it to fetch `/api/v1/stations` live, or pass a
+saved dump (Python-literal or strict JSON, both parse). `--mask` is the
+`terrain.py` mask and must be projected in metres — the buffer distance and the
+output coordinates are metres in its CRS. Only stations with a non-empty
+`devices.weather` are kept; the weather-less placeholders in the dump are
+dropped. The output follows the ET manifest contract
+(`station_id, x, y, crs, elevation_m, name, source`) plus two carried columns:
+`device` (instrument serial, provenance only) and `in_mask`.
+
+**`--dem` is not optional for Penman–Monteith.** The API carries no elevation,
+but FAO-56 needs it (air pressure, hence γ, hence ET₀, depends on station
+height), so the manifest samples the terrain DEM. A far buffer station off the
+DEM footprint is left `elevation_m` blank with a warning rather than given a fake
+height — the ET stage can fall back to temperature-only Hargreaves there. Omit
+`--dem` entirely and every elevation is blank (a Hargreaves-only run).
+
+Keep the buffer. A station just outside the divide still constrains the ET field
+at the edge; `in_mask` records which stations are strictly inside. ET₀ varies
+smoothly, so a couple of stations is ample — for the Ohlanga, one broadcast
+uniformly is reasonable.
+
+**Pull the series — `weather_measurements`.** Fetches each station in the
+manifest over a date window and writes the long `weather_measurements.csv`.
+
+```bash
+python -m topkapi_setup.forcing.sources.weather_measurements \
+    --manifest  projects/umhlanga/forcing/weather_manifest.csv \
+    --start 20250101 --end 20250131 \
+    --out       projects/umhlanga/forcing/weather_measurements.csv \
+    --cache-dir projects/umhlanga/raw/weather
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--cache-dir` | none | raw JSON per station-window; provenance, and resumes a run |
+| `--min-interval` | `1.0` | seconds between requests; raise it if `429` persists |
+| `--auth-scheme` | `bearer` | Authorization header scheme |
+| `--discover` | — | print the raw field names one station reports, then exit |
+| `--station` | — | station id for `--discover` |
+
+The output is long — `datetime, station_id, variable, value` — with one row per
+variable per reading (a station reports several variables, so it's long in
+`variable` as well as in time). This collector lands the sub-daily observations
+faithfully and does **no** ET aggregation; daily `tmax`/`tmin`/`tmean` reduction
+and gap handling are the ET `met` stage's job.
+
+Three things about this feed, all handled by the adapter:
+
+- **Auth is `Bearer <key>`** from `$ETHEKWINI_FEWS_KEY`. A `401` means the key is
+  absent in the shell you ran from.
+- **It rate-limits.** Requests are paced `--min-interval` apart and a `429`/`503`
+  is retried with backoff, honouring `Retry-After`; with `--cache-dir` set a
+  throttled run resumes rather than restarting.
+- **No data is normal.** An offline station, or a window predating its record,
+  returns an empty `weather` list. That station is skipped and flagged `no data`
+  in the run report, never raised — scan the report for stations that came back
+  empty.
+
+**Check for unmapped fields when a feed changes.** The reading fields are mapped onto the canonical ET variables (`temp`, `rh`, `wind`, `solar`, …) by `VARIABLE_MAP` in the module; unmapped keys are ignored, so a feed that adds or renames a field yields a short file, never a wrong one. `--discover` prints each raw field and what it maps to (`(unmapped)` for the rest), so pinning a new one is a one-line edit:
+
+```bash
+python -m topkapi_setup.forcing.sources.weather_measurements \
+    --discover --station 3393 --start 20250101 --end 20250102
+```
+
+Pick a warm, non-empty window so readings exist to inspect.
+
+**Timezone — confirm before calibration.** As with rainfall, stamps are emitted
+naive; set the zone once on the ET `Timeline` and pin it against a known onset. A
+silent 2 h offset is invisible in daily ET totals but wrong against the diurnal
+disaggregation.
+
+### 5.2 QC and daily-reduce the weather record — `met`
+
+Between the raw `weather_measurements.csv` and the ET₀ calc sits one cleaning
+step. The feed lands dropouts as in-band numbers (a `temp` of `0.0`, a `wind`
+of `-9990`), and FAO-56 is computed daily, so `met` drops the sentinels per
+variable and collapses the sub-daily readings to a per-station daily table —
+the input `penman` (next stage) reduces to ET₀/E₀.
+
+```bash
+python -m topkapi_setup.forcing.met \
+    --measurements projects/umhlanga/forcing/weather_measurements.csv \
+    --manifest     projects/umhlanga/forcing/weather_manifest.csv \
+    --tz Africa/Johannesburg \
+    --out          projects/umhlanga/forcing/weather_daily.csv
+```
+
+It prints three things and (with `--out`) writes the daily table:
+
+- **QA report** — readings dropped per station/variable. Scan the
+  `pct_dropped` column: a few percent on `temp` is the `0.0` dropout, a chunk on
+  `wind` is the `-9990` flag; `solar` should be `0.0` (night zeros are kept, not
+  dropped).
+- **Daily table (head)** — one row per station per day: `tmax/tmin/tmean`, mean
+  `wind`, mean `solar`, and `rh` (from the feed's `relativeHumidity`). Penman-Monteith
+  uses all of these; a station missing humidity falls back to Hargreaves.
+- **Coverage** — days with a *complete* aggregate per variable. A station with
+  many days but few complete `wind` days is telling you wind is the weak input
+  before it quietly biases ET₀.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--measurements` | required | long `weather_measurements.csv` |
+| `--manifest` | none | `weather_manifest.csv`; checks station ids and flags any in the measurements but absent from the manifest |
+| `--tz` | none | timezone for the calendar-day boundary; pass the run's `Timeline` tz (e.g. `Africa/Johannesburg`) |
+| `--min-coverage` | `0.8` | fraction of a day's expected readings a variable needs, or that day's aggregate is suppressed to NaN |
+| `--out` | none | write the daily table to CSV |
+
+`--min-coverage` is the guard against a warm-biased `tmax` from a half-empty
+day: the expected count is inferred from each station's own modal step (48 for
+the half-hourly feed), so a logger outage or the ragged first/last day of a
+record lands as NaN rather than a fake extreme. The sentinel rules are the
+per-variable `QA_RULES` in `met.py` — override them there if a station needs a
+tighter range.
+
+**Two reductions, not one.** The CLI above writes the *daily* table
+(`daily_table`), the FAO-56 daily input. `met` also carries `step_table`, which
+aggregates the same cleaned readings straight onto the model `Timeline` — one
+row per station per `Dt` step, the input for hourly Penman-Monteith. You do not
+call it directly: `penman` (§5.3) picks the reduction from the data resolution,
+below.
+
+### 5.3 Reference and open-water ET — `penman`
+
+Turns the daily table into the two demand fields the solver reads: `ET0` (`ETr`,
+reference grass) and open-water `E0` (`ETo`, the channel rate). FAO-56
+Penman-Monteith where radiation and humidity allow, Hargreaves (temperature
+only) where they don't — chosen per station-day.
+
+```bash
+python -m topkapi_setup.forcing.penman \
+    --daily    projects/umhlanga/forcing/weather_daily.csv \
+    --manifest projects/umhlanga/forcing/weather_manifest.csv \
+    --out      projects/umhlanga/forcing/et0_daily.csv
+```
+
+It prints the method split (Penman-Monteith vs Hargreaves), per-station ET0
+min/mean/max, and the head; with `--out` it writes `station_id, date, et0, eto,
+method`. Latitude comes from the manifest coordinates (reprojected to lon/lat),
+elevation from its `elevation_m` — both feed the radiation and pressure terms.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--daily` | required | daily table from `met` |
+| `--manifest` | required | weather manifest — supplies `elevation_m` and latitude |
+| `--wind-height` | `2.0` | anemometer height (m) for the 2 m adjustment; set 10 for a typical AWS once confirmed |
+| `--method` | `auto` | `auto` (Penman-Monteith where data allow, else Hargreaves) or `hargreaves` to force temperature-only |
+| `--out` | none | write the per-station-day ET0/ETo CSV |
+
+Two things worth a glance. **`ET0` is mm/day here** — this CLI reports the daily
+figure. And **Hargreaves is temperature-driven**, so a stuck-high `tmax`
+inflates it directly (a 48 °C sensor day gives a ~10 mm/day ET0 that is not
+real); tighten the temperature ceiling in `met`'s `QA_RULES`, or lean on
+Penman-Monteith, which is radiation-driven and less hostage to a bad `tmax`. The
+everyday FAO-56 formulas live as pure functions in `penman.py`, checked against
+the FAO-56 worked example (ET0 = 3.9 mm/day), for when you want them from a
+notebook.
+
+#### Resolution: use the sub-daily feed, or disaggregate a daily one
+
+The daily CLI above is the report; `et0_eto_on_clock` is what the ET.h5 writer
+actually calls, and it does **not** always go through a daily total. The
+eThekwini network reports every half hour, and throwing that away to compute a
+daily ET0 and smear it back over the hours by a fixed clear-sky shape would
+erase the real diurnal signal — a January afternoon of convective cloud that
+collapses the measured radiation shows up in the data but not in a clear-sky
+curve. So the routine decides, **per station**, from the native sampling step
+against the model `Dt`:
+
+| Native step vs `Dt` | What runs | Disaggregation |
+|---|---|---|
+| `native ≤ Dt`, `Dt` sub-daily | hourly Penman-Monteith at `Dt` (Allen 2006: `Cn=37`, day/night `Cd` and soil-heat-flux), from `met.step_table` | none — the feed is used as measured |
+| `native ≤ Dt`, `Dt` daily | daily Penman-Monteith | none |
+| `native > Dt`, `Dt` sub-daily | daily Penman-Monteith, then split across the hours by the clear-sky solar shape | **yes — the only path that disaggregates** |
+| `Dt` daily | daily Penman-Monteith mapped to each daily step | none |
+
+So the daily-total-then-disaggregate path fires only when the input is genuinely
+coarser than the model *and* the model is sub-daily — a daily SAWS record under
+an hourly run. Given a sub-daily feed, hourly Penman-Monteith uses the measured
+radiation, temperature, humidity and wind at each step, and a run of steps sums
+to the day's ET with no separate disaggregation. On the sub-daily path,
+open-water `ETo` is the hourly `ETr` scaled by that day's `E0/ET0` ratio from
+the daily Penman open-water, so the sub-percent channel term stays consistent
+with the daily path and falls back to `ETo = ETr` on temperature-only days. Both
+paths ride the one `Timeline`, and the per-`Dt` depths are in **mm per step**,
+the unit `ET.h5` wants.
+
+*Still to land in the ET stage: nothing new here — the `(n_t, n_cells)` writer
+to `ET.h5` (with the §4.6 cell-order guard) is delivered as its own patch
+(`etfields`), and it consumes exactly the per-step `ETr`/`ETo` readings this
+router returns.*
+
+### 5.4 Build `ET.h5` end to end — `forcing et`
+
+The ET twin of §4: weather manifest + measurements in, `ET.h5` (`ETr` + `ETo`)
+out, with the cell-order guard armed and provenance merged into the shared
+`forcing_manifest.json` under an `"et"` key (the rainfall section is left
+intact). It resolution-routes internally (§5.3), so a sub-daily feed is used at
+the model step and only a daily feed is disaggregated — you do not choose.
+
+```bash
+python -m topkapi_setup.forcing et \
+    --manifest     projects/umhlanga/forcing/weather_manifest.csv \
+    --measurements projects/umhlanga/forcing/weather_measurements.csv \
+    --mask         projects/umhlanga/terrain/mask.tif \
+    --cell-param   projects/umhlanga/cell_param.dat \
+    --start "2025-01-01 01:00" --end "2025-02-01 00:00" --dt 3600 \
+    --tz Africa/Johannesburg --tz-meridian 30 \
+    --method idw --group ohlanga_jan2025 \
+    --out projects/umhlanga/forcing/ET.h5
+```
+
+Every clock and interpolation flag matches `rain` (same `W`, same guard, same
+`--trim`/`--buffer-km`/`--min-coverage`); the ET-only flags are:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--et-method` | `auto` | `auto` (Penman–Monteith where data allow, else Hargreaves) or `hargreaves` to force temperature-only |
+| `--wind-height` | `2.0` | anemometer height (m) for the 2 m adjustment; set `10` for a typical AWS once confirmed |
+| `--tz-meridian` | none | standard-meridian longitude of the clock (`30` for SAST); only nudges the clear-sky disaggregation shape, so it matters only on the daily-input path |
+
+The run prints steps × cells, stations used, the **resolution path per station**
+(so you can see the sub-daily feed being used directly, not smeared from a daily
+total), coverage, and a day-mean-vs-night-mean line — ET should breathe with the
+sun, near zero at night. If a step has *no* station reporting at all, it refuses
+rather than zero-fill: loosen `--min-coverage`, add `--trim`, or fill the gap (gap-filling is
+the subject of its own design note — reanalysis backfill, a neighbour-station
+regression, or a diurnal-climatology fill).
+
+---
 ## Writing new stages
 
 Keep the contract every module here follows, so this file and `--help` stay the
@@ -760,5 +1033,6 @@ A module is not "done" until (1)–(5) hold and the suite is green.
 | M1 | preflight / terrain / viz | `preflight`, `terrain`, `viz` | done |
 | M2 | parameter rasters | `params`, `soil_table` | done |
 | M3 | forcing builder (rainfall) | `forcing`, `forcing.sources.*` | done |
+| M3 | forcing builder (ET) | `met`, `penman`, `forcing.sources.weather_*` | sources/met/penman + resolution routing done; ET.h5 writer ships as `etfields` patch |
 | M4 | config + run (`--check`) | `config`, `run` | to do |
 | M5 | calibration | `calibrate` | to do |
