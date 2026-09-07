@@ -685,5 +685,6 @@ def channel_properties(cell_labels, channel_network, X, Y, cell_down, dem):
 
     Xc[outlet_indx] = Xc[upstream_indx]
     tan_beta_channel[outlet_indx] = tan_beta_channel[upstream_indx]
+    tan_beta_channel[channel_network == 1] = np.maximum(tan_beta_channel[channel_network == 1], np.tan(np.radians(0.1)))
 
     return Xc, tan_beta_channel
