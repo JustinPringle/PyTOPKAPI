@@ -286,7 +286,7 @@ def qas(a, b, alpha, V0, delta_t,derivative=0):
     else:
         V1=y1
 
-    if (V1 - V0)/delta_t > a:
+    if not isfinite(V1) or (V1 - V0)/delta_t > a:
         return None
 
     return V1
