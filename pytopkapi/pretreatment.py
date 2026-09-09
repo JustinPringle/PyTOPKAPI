@@ -4,7 +4,6 @@ Functions required to compute the intrinsic TOPKAPI parameters from the
 physical parameters
 
 """
-import warnings
 
 import numpy as np
 import networkx as nx
@@ -414,16 +413,18 @@ def compute_cell_param(X, ar_Xc, Dt, alpha_s, alpha_o,
     ar_W = W_max + ((W_max-W_min)/(A_total**0.5-A_thres**0.5)) \
            * (ar_A_drained**0.5-A_total**0.5)
 
-    with warnings.catch_warnings():
-        # Cells without channel stores cause harmless zero-division errors
-        warnings.filterwarnings('ignore',
-                                r'divide by zero encountered in true_divide')
+    # Cells without a channel store carry n_c = 0 and tan_beta_channel = 0,
+    # so evaluating the channel terms over the whole grid divides by zero and
+    # produces NaN that is discarded two lines later. Evaluate on the channel
+    # cells only: same result, no spurious warnings, and a NaN appearing here
+    # in future is a real defect rather than expected noise.
+    chan = ar_lambda != 0
 
-        ar_Cc=(1/ar_n_c)*(ar_tan_beta_channel)**0.5
+    ar_W[~chan] = -99.9
+    ar_b_c = np.zeros(ar_lambda.shape) - 99.9
 
-    ar_b_c=ar_Cc*ar_W/((ar_Xc*ar_W)**(alpha_c))
-    ar_W[ar_lambda==0]=-99.9
-    ar_b_c[ar_lambda==0]=-99.9
+    ar_Cc = (1/ar_n_c[chan])*(ar_tan_beta_channel[chan])**0.5
+    ar_b_c[chan] = ar_Cc*ar_W[chan]/((ar_Xc[chan]*ar_W[chan])**(alpha_c))
 
     return ar_Vsm, ar_b_s, ar_b_o, ar_W, ar_b_c
 
