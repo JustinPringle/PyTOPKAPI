@@ -325,8 +325,8 @@ def run(ini_file='plot_flow_precip.ini'):
             warnings.warn("Cannot align Qobs without a start_datetime and "
                           "with mismatched length; skipping observed flow.")
 
-    plot_hyetograph(ar_date, ar_rain=ar_rain, ar_Qobs=ar_Qobs,
-                        title=group_name, image_out=rain_image_out)
+    # plot_hyetograph(ar_date, ar_rain=ar_rain, ar_Qobs=ar_Qobs,
+    #                     title=group_name, image_out=rain_image_out)
     plot_hydrograph(ar_date, ar_Qsim, ar_rain=ar_rain, ar_Qobs=ar_Qobs,
                     title=group_name, image_out=image_out)
 

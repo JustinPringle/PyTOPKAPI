@@ -43,6 +43,7 @@ docs/build/
 # Several SA layers (Land Type, DWS flow, WWTW records) are licence-
 # restricted and must NOT be committed. Keep raw data out of the repo;
 # commit only configs and manifests. Adjust these paths to taste.
+projects/*
 projects/*/data/
 projects/*/terrain/
 projects/*/soil/

@@ -225,3 +225,41 @@ def test_rasterize_land_type_vector(tmp_path):
     arr, code_to_key = P.rasterize_land_type(str(vec), "landtype", grid)
     assert set(code_to_key.values()) == {"Fa491", "Ac207"}
     assert set(np.unique(arr)) <= {0, 1, 2}
+
+
+# --- SANLC crosswalk -------------------------------------------------------
+
+def test_sanlc_crosswalk_covers_all_73_classes():
+    """Every gazetted SANLC class must resolve; a fall-through is a silent
+    default, which is how the whole catchment ended up at 0.15."""
+    assert sorted(P.DEFAULT_SANLC_CROSSWALK) == list(range(1, 74))
+
+
+@pytest.mark.parametrize("table", ["SANLC_N_O", "SANLC_KC"])
+def test_sanlc_groups_resolve(table):
+    lookup = getattr(P, table)
+    missing = sorted({g for g in P.DEFAULT_SANLC_CROSSWALK.values()
+                      if g not in lookup})
+    assert not missing, f"{table} has no entry for {missing}"
+
+
+def test_sanlc_n_o_within_param_range():
+    lo, hi = P.PARAM_RANGES["n_o"]
+    bad = {k: v for k, v in P.SANLC_N_O.items() if not lo <= v <= hi}
+    assert not bad, bad
+
+
+def test_built_up_mixing_rule_is_reproducible():
+    """n_eff must be the stated area-weighted blend, not a hand-set number."""
+    for name, f_imp, n_perv in P._BUILT_UP_MIX:
+        expected = round(f_imp * P.N_O_SEALED + (1.0 - f_imp) * n_perv, 3)
+        assert P.SANLC_N_O[name] == expected
+
+
+def test_manning_from_landcover_maps_without_warning(recwarn):
+    codes = np.array([[36, 49, 53], [65, 67, 22]], dtype="int32")
+    n_o = P.manning_from_landcover(codes)
+    assert not [w for w in recwarn if "not in lookup" in str(w.message)]
+    assert n_o[0, 0] == pytest.approx(P.SANLC_N_O["sugarcane"])
+    # a 30 m residential cell is rougher than a sealed commercial one
+    assert n_o[0, 1] > n_o[1, 0]

@@ -67,6 +67,50 @@ NONCHANNEL_VALUE = np.uint8(255)   # only 255 decodes to "not channel"
 #: solver's routing terms blow up.
 DEFAULT_MIN_SLOPE_DEG = 0.1
 
+#: A snap further than this many cells means the outlet coordinate is wrong, not
+#: merely offset. Bounds the otherwise unbounded nearest-neighbour search.
+DEFAULT_MAX_SNAP_CELLS = 50
+
+
+# --- Outlet validation ------------------------------------------------------
+
+def check_outlet_in_dem(dem_path: str, outlet_xy) -> tuple[float, float]:
+    """Raise unless ``outlet_xy`` lies inside ``dem_path``, in its CRS.
+
+    Guards the units trap: degrees passed to a projected DEM are read as metres,
+    land the point millions of metres away, and the snap still returns whatever
+    channel is nearest the grid corner -- a clean run on the wrong river.
+    Checked before any conditioning, so the error costs nothing.
+    """
+    x, y = float(outlet_xy[0]), float(outlet_xy[1])
+    with rasterio.open(dem_path) as s:
+        b, crs = s.bounds, s.crs
+    if crs is not None and crs.is_projected and abs(x) <= 180 and abs(y) <= 90:
+        raise ValueError(
+            f"outlet ({x:g}, {y:g}) looks like decimal degrees, but {dem_path} "
+            f"is projected ({crs}). Convert it first:\n"
+            f"    python -m topkapi_setup.preflight outlet "
+            f"--lon <lon> --lat <lat> --epsg {crs.to_epsg()}\n"
+            f"Longitude first, latitude second, both decimal degrees.")
+    if not (b.left <= x <= b.right and b.bottom <= y <= b.top):
+        raise ValueError(
+            f"outlet ({x:g}, {y:g}) lies outside the DEM. {dem_path} covers "
+            f"({b.left:.0f}, {b.bottom:.0f}) to ({b.right:.0f}, {b.top:.0f}) "
+            f"in {crs}.")
+    return x, y
+
+
+def acc_cells_from_km2(dem_path: str, km2: float) -> int:
+    """Convert a drainage-area threshold in km^2 to cells for this DEM.
+
+    The cell count is resolution-dependent -- 5000 cells is 4.5 km^2 at 30 m and
+    18 km^2 at 60 m -- so a recipe written in cells silently changes meaning when
+    the DEM does. Area is the invariant; state it in km^2 and convert here.
+    """
+    with rasterio.open(dem_path) as s:
+        cell_area = abs(s.res[0] * s.res[1])
+    return max(1, int(round(km2 * 1e6 / cell_area)))
+
 
 @dataclass
 class TerrainResult:
@@ -163,16 +207,31 @@ def flow_accumulation(grid, fdir):
     return grid.accumulation(fdir, dirmap=ARCGIS_DIRMAP)
 
 
-def snap_outlet(grid, acc, outlet_xy, min_acc_cells=100):
+def snap_outlet(grid, acc, outlet_xy, min_acc_cells=100,
+                max_snap_cells=DEFAULT_MAX_SNAP_CELLS):
     """Snap a nominal outlet coordinate onto the drainage network.
 
     Moves ``outlet_xy`` to the nearest cell whose accumulation exceeds
     ``min_acc_cells``, so a coordinate digitised a pixel or two off the channel
     still lands on the river.
+
+    The search has no upper bound on distance, so it always returns *something*.
+    ``max_snap_cells`` bounds it: an offset coordinate moves a few cells, and
+    anything further is a wrong coordinate. Pass ``None`` to disable.
     """
     x, y = outlet_xy
     xs, ys = grid.snap_to_mask(acc > min_acc_cells, (x, y))
-    return float(xs), float(ys)
+    xs, ys = float(xs), float(ys)
+    if max_snap_cells is not None:
+        cell_size = abs(grid.affine.a)
+        moved = float(np.hypot(xs - x, ys - y))
+        if moved > max_snap_cells * cell_size:
+            raise ValueError(
+                f"outlet ({x:.0f}, {y:.0f}) snapped {moved / 1000:.1f} km to "
+                f"({xs:.0f}, {ys:.0f}) -- further than {max_snap_cells} cells. "
+                f"That is a wrong coordinate, not an offset one: check the units "
+                f"and the CRS, or run `preflight reveal` to find the channel.")
+    return xs, ys
 
 
 def delineate(grid, fdir, outlet_xy):
@@ -269,6 +328,7 @@ def build_terrain(
     a_thres_m2: float,
     min_slope_deg: float = DEFAULT_MIN_SLOPE_DEG,
     min_acc_cells: int = 100,
+    max_snap_cells: int | None = DEFAULT_MAX_SNAP_CELLS,
     validate: bool = True,
 ) -> TerrainResult:
     """Run the full terrain stage and write the four rasters to ``out_dir``.
@@ -280,6 +340,7 @@ def build_terrain(
     out.mkdir(parents=True, exist_ok=True)
 
     grid, dem = load_grid(dem_path)
+    outlet_xy = check_outlet_in_dem(dem_path, outlet_xy)
     transform = dem.affine
     crs = dem.crs
     cell_size = abs(transform.a)
@@ -288,7 +349,8 @@ def build_terrain(
     fdir = flow_direction(grid, conditioned)
     acc = flow_accumulation(grid, fdir)
 
-    snapped = snap_outlet(grid, acc, outlet_xy, min_acc_cells=min_acc_cells)
+    snapped = snap_outlet(grid, acc, outlet_xy, min_acc_cells=min_acc_cells,
+                          max_snap_cells=max_snap_cells)
     catch = delineate(grid, fdir, snapped)
 
     mask = build_mask(catch)
@@ -390,13 +452,21 @@ def _build_arg_parser():
                     "slope) from a DEM and an outlet coordinate.")
     p.add_argument("--dem", required=True, help="DEM GeoTIFF (projected, metres)")
     p.add_argument("--outlet", required=True, nargs=2, type=float,
-                   metavar=("X", "Y"), help="Outlet coordinate in the DEM CRS")
+                   metavar=("X", "Y"),
+                   help="Outlet coordinate in the DEM CRS -- metres, not degrees. "
+                        "Use `preflight outlet` to convert lon/lat.")
     p.add_argument("--a-thres", required=True, type=float,
                    help="Channel-initiation area A_thres in m^2")
     p.add_argument("--out", required=True, help="Output directory")
     p.add_argument("--min-slope-deg", type=float, default=DEFAULT_MIN_SLOPE_DEG)
-    p.add_argument("--min-acc-cells", type=int, default=100,
-                   help="Accumulation floor for snapping the outlet")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--min-acc-km2", type=float,
+                   help="Accumulation floor for snapping, as drainage area "
+                        "(resolution-independent; preferred over --min-acc-cells)")
+    g.add_argument("--min-acc-cells", type=int,
+                   help="Accumulation floor for snapping the outlet (default 100)")
+    p.add_argument("--max-snap-cells", type=int, default=DEFAULT_MAX_SNAP_CELLS,
+                   help="Reject a snap further than this many cells; 0 disables")
     p.add_argument("--no-validate", action="store_true",
                    help="Skip the cell_connectivity self-check")
     return p
@@ -404,12 +474,22 @@ def _build_arg_parser():
 
 def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
-    result = build_terrain(
-        dem_path=args.dem, outlet_xy=(args.outlet[0], args.outlet[1]),
-        out_dir=args.out, a_thres_m2=args.a_thres,
-        min_slope_deg=args.min_slope_deg, min_acc_cells=args.min_acc_cells,
-        validate=not args.no_validate,
-    )
+    if args.min_acc_km2 is not None:
+        min_acc = acc_cells_from_km2(args.dem, args.min_acc_km2)
+    else:
+        min_acc = args.min_acc_cells if args.min_acc_cells else 100
+    try:
+        result = build_terrain(
+            dem_path=args.dem, outlet_xy=(args.outlet[0], args.outlet[1]),
+            out_dir=args.out, a_thres_m2=args.a_thres,
+            min_slope_deg=args.min_slope_deg, min_acc_cells=min_acc,
+            max_snap_cells=args.max_snap_cells or None,
+            validate=not args.no_validate,
+        )
+    except ValueError as exc:        # bad coordinate, not a bug: no traceback
+        import sys
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
     print(f"Catchment: {result.n_cells} cells, "
           f"{result.n_channel_cells} channel cells, outlet {result.outlet_xy}")
     print(f"flowdir_source = {result.flowdir_source}")
