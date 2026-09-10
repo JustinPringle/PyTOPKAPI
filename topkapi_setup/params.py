@@ -29,7 +29,10 @@ one texture-does-everything lookup:
   through the Rawls & Brakensiek / Maidment (1993) Green-Ampt table
   (:data:`RAWLS_BROOKS_COREY`) -- the same table Maidment (1993) supplied to the
   original SA work.
-* **``n_o``** comes from land cover (SANLC) via a Chow-type roughness lookup.
+* **``n_o``** comes from land cover (SANLC) via an Engman (1986) overland-flow
+  roughness lookup (:data:`SANLC_N_O`), keyed by the full 73-class gazetted
+  legend (:data:`DEFAULT_SANLC_CROSSWALK`).  Built-up classes are blended,
+  not sealed -- see the mixing rule beside :data:`_BUILT_UP_MIX`.
 
 The primary input is therefore a **Land Type raster + a per-land-type attribute
 CSV** (``land_type, L_m, theta_s, texture`` -- or ``clay_pct``/``sand_pct`` when
@@ -118,19 +121,162 @@ TEXTURE_ALIASES: dict[str, str] = {
 #: Fallback per-texture soil depth (m) when no Land Type / measured depth given.
 DEFAULT_SOIL_DEPTH_M: dict[str, float] = {t: 1.0 for t in RAWLS_BROOKS_COREY}
 
-#: Overland Manning n_o by SANLC 2020 class group (Chow-type roughness).
+#: Manning n for a fully sealed surface (asphalt/concrete), used as the
+#: impervious end-member of the built-up mixing rule below.  Engman (1986).
+N_O_SEALED = 0.013
+
+#: Built-up mixing rule (Kalyanapu et al., 2009): a 30 m built-up cell is not
+#: concrete, it is roofs and roads *plus* gardens and verges.  Its effective
+#: roughness is the area-weighted blend of the sealed end-member and the
+#: pervious cover SANLC reports for that cell:
+#:
+#:     n_eff = f_imp * N_O_SEALED + (1 - f_imp) * n_pervious
+#:
+#: ``f_imp`` is the impervious fraction of the built-up class; ``n_pervious``
+#: is the open-country group whose cover the SANLC sub-class names.  Both are
+#: kept explicit so the numbers can be re-derived rather than trusted.
+#: (group name, f_imp, pervious n)
+_BUILT_UP_MIX: tuple[tuple[str, float, float], ...] = (
+    ("residential_formal_tree",    0.45, 0.250),
+    ("residential_formal_bush",    0.45, 0.200),
+    ("residential_formal_grass",   0.45, 0.150),
+    ("residential_formal_bare",    0.45, 0.040),
+    ("residential_informal_tree",  0.35, 0.250),
+    ("residential_informal_bush",  0.35, 0.200),
+    ("residential_informal_grass", 0.35, 0.150),
+    ("residential_informal_bare",  0.35, 0.040),
+    ("village_scattered",          0.20, 0.150),
+    ("village_dense",              0.45, 0.150),
+    ("smallholding_tree",          0.10, 0.300),
+    ("smallholding_bush",          0.10, 0.200),
+    ("smallholding_grass",         0.10, 0.150),
+    ("smallholding_bare",          0.10, 0.040),
+    ("recreational_tree",          0.10, 0.300),
+    ("recreational_bush",          0.10, 0.200),
+    ("recreational_grass",         0.10, 0.150),
+    ("recreational_bare",          0.10, 0.040),
+    ("commercial",                 0.85, 0.150),
+    ("industrial",                 0.85, 0.150),
+    ("roads_rail",                 0.95, 0.150),
+)
+
+#: Overland Manning n_o by SANLC 2020 class group.
+#:
+#: Open-country values are Engman (1986) effective overland-flow roughnesses
+#: (the same table TR-55 Table 3-1 draws on): bare soil 0.010-0.05, cultivated
+#: with residue 0.06-0.17, short-grass prairie 0.15, dense grass 0.24, woods
+#: with light underbrush 0.40.  These are plot-scale values and already include
+#: raindrop impact and micro-channelling.  ``built_up`` is retained as a coarse
+#: fallback; the sub-class groups below it are the ones the crosswalk uses.
 SANLC_N_O: dict[str, float] = {
-    "water_wetland": 0.030, "bare_eroded": 0.050, "cultivated": 0.100,
-    "grassland": 0.150, "bush_thicket": 0.250, "forest": 0.400, "built_up": 0.015,
+    "water": 0.030,
+    "wetland_herbaceous": 0.300,
+    "wetland_woody": 0.400,
+    "rock": 0.030,
+    "bare": 0.040,
+    "eroded": 0.035,
+    "fallow_bare": 0.050,
+    "grassland": 0.150,
+    "shrubland": 0.200,
+    "bush_thicket": 0.250,
+    "open_woodland": 0.300,
+    "plantation": 0.350,
+    "plantation_clearfelled": 0.100,
+    "forest": 0.400,
+    "cultivated": 0.100,
+    "cultivated_perennial": 0.150,
+    "sugarcane": 0.200,
+    "mine": 0.050,
+    # legacy coarse groups, kept so older configs still resolve
+    "water_wetland": 0.030,
+    "bare_eroded": 0.040,
+    "built_up": 0.060,
+}
+SANLC_N_O.update({
+    name: round(f_imp * N_O_SEALED + (1.0 - f_imp) * n_perv, 3)
+    for name, f_imp, n_perv in _BUILT_UP_MIX
+})
+
+#: SANLC 2020 raster-code -> group crosswalk, all 73 gazetted classes.
+#:
+#: Class numbering is the gazetted SA Land-Cover legend (SANS 19144-2, SDI Act
+#: 54 of 2003), unchanged across the 2018 / 2020 / 2022 SANLC releases.  Verify
+#: against the legend shipped with your own raster before trusting it: some
+#: distributions renumber, and a silent renumbering is the same failure class
+#: as a permuted cell order.
+DEFAULT_SANLC_CROSSWALK: dict[int, str] = {
+    # 1-13  natural woody and grassy cover
+    1: "forest", 2: "bush_thicket", 3: "forest", 4: "open_woodland",
+    5: "plantation", 6: "open_woodland", 7: "plantation_clearfelled",
+    8: "shrubland", 9: "shrubland", 10: "shrubland", 11: "shrubland",
+    12: "shrubland", 13: "grassland",
+    # 14-21  water bodies, natural and artificial
+    14: "water", 15: "water", 16: "water", 17: "water",
+    18: "water", 19: "water", 20: "water", 21: "water",
+    # 22-24, 73  wetlands
+    22: "wetland_herbaceous", 23: "wetland_herbaceous", 24: "wetland_woody",
+    73: "wetland_herbaceous",
+    # 25-31  bare, rock and eroded
+    25: "rock", 26: "rock", 27: "eroded", 28: "bare",
+    29: "bare", 30: "bare", 31: "bare",
+    # 32-41  cultivated
+    32: "cultivated_perennial", 33: "cultivated_perennial",
+    34: "sugarcane", 35: "cultivated_perennial", 36: "sugarcane",
+    37: "sugarcane", 38: "cultivated", 39: "cultivated",
+    40: "cultivated", 41: "cultivated",
+    # 42-46  fallow land and old fields
+    42: "open_woodland", 43: "bush_thicket", 44: "grassland",
+    45: "fallow_bare", 46: "shrubland",
+    # 47-64  built-up residential, village, smallholding, recreational
+    47: "residential_formal_tree", 48: "residential_formal_bush",
+    49: "residential_formal_grass", 50: "residential_formal_bare",
+    51: "residential_informal_tree", 52: "residential_informal_bush",
+    53: "residential_informal_grass", 54: "residential_informal_bare",
+    55: "village_scattered", 56: "village_dense",
+    57: "smallholding_tree", 58: "smallholding_bush",
+    59: "smallholding_grass", 60: "smallholding_bare",
+    61: "recreational_tree", 62: "recreational_bush",
+    63: "recreational_grass", 64: "recreational_bare",
+    # 65-67  built-up commercial, industrial, linear
+    65: "commercial", 66: "industrial", 67: "roads_rail",
+    # 68-72  mines and landfill
+    68: "mine", 69: "mine", 70: "mine", 71: "mine", 72: "mine",
 }
 
-#: Default SANLC 2020 raster-code -> group crosswalk (edit for your product version).
-DEFAULT_SANLC_CROSSWALK: dict[int, str] = {
-    1: "forest", 2: "forest", 3: "forest", 4: "bush_thicket", 5: "bush_thicket",
-    6: "grassland", 7: "water_wetland", 8: "water_wetland", 9: "bare_eroded",
-    10: "bare_eroded", 11: "cultivated", 12: "cultivated", 13: "built_up",
-    14: "built_up", 15: "built_up",
+#: Pervious-fraction crop factor for each built-up group, keyed to the cover
+#: its SANLC sub-class names.  Impervious end-member kc = 0.10.
+_KC_PERVIOUS: dict[str, float] = {
+    "residential_formal_tree": 0.90,    "residential_formal_bush": 0.80,
+    "residential_formal_grass": 0.85,   "residential_formal_bare": 0.25,
+    "residential_informal_tree": 0.90,  "residential_informal_bush": 0.80,
+    "residential_informal_grass": 0.85, "residential_informal_bare": 0.25,
+    "village_scattered": 0.85,          "village_dense": 0.85,
+    "smallholding_tree": 0.90,          "smallholding_bush": 0.80,
+    "smallholding_grass": 0.85,         "smallholding_bare": 0.25,
+    "recreational_tree": 0.90,          "recreational_bush": 0.80,
+    "recreational_grass": 0.90,         "recreational_bare": 0.25,
+    "commercial": 0.85, "industrial": 0.85, "roads_rail": 0.85,
 }
+
+#: SANLC code -> crop factor kc (cell_param column 18), FAO-56 Table 12 kc_mid,
+#: with built-up classes blended by the same impervious fraction as n_o.
+#:
+#: NOT WIRED IN.  ``build_cell_param`` still writes a uniform ``--kc``; making
+#: kc spatial is a ``modify_file`` post-step and its own patch.  The table is
+#: here so the values are versioned and reviewable before that lands.
+SANLC_KC: dict[str, float] = {
+    "water": 1.05, "wetland_herbaceous": 1.20, "wetland_woody": 1.10,
+    "rock": 0.15, "bare": 0.20, "eroded": 0.20, "fallow_bare": 0.30,
+    "grassland": 0.85, "shrubland": 0.70, "bush_thicket": 0.85,
+    "open_woodland": 0.90, "plantation": 1.00, "plantation_clearfelled": 0.35,
+    "forest": 1.00, "cultivated": 1.15, "cultivated_perennial": 0.90,
+    "sugarcane": 1.25, "mine": 0.15,
+    "water_wetland": 1.05, "bare_eroded": 0.20, "built_up": 0.50,
+}
+SANLC_KC.update({
+    name: round(f_imp * 0.10 + (1.0 - f_imp) * _KC_PERVIOUS[name], 2)
+    for name, f_imp, _ in _BUILT_UP_MIX
+})
 
 PARAM_RANGES: dict[str, tuple[float, float]] = {
     "soil_depth": (0.1, 5.0), "Ks": (1e-6, 1.0), "theta_r": (0.0, 0.20),

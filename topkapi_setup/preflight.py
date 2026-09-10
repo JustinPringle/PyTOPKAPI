@@ -57,6 +57,18 @@ def outlet_in_crs(lat_dms: str, lon_dms: str, epsg: int) -> tuple[float, float]:
     return float(x), float(y)
 
 
+# --- Outlet validation ------------------------------------------------------
+
+# These live in ``terrain``: it is the lower layer, ``build_terrain`` needs the
+# same guards, and one definition cannot drift from the other. Re-exported here
+# because preflight is where a user meets them first.
+from topkapi_setup.terrain import (          # noqa: E402  (grouped with its kin)
+    DEFAULT_MAX_SNAP_CELLS,
+    acc_cells_from_km2,
+    check_outlet_in_dem,
+)
+
+
 # --- Step 1: inspect --------------------------------------------------------
 
 def inspect_dem(path: str) -> dict:
@@ -133,7 +145,13 @@ def reveal_rivers(dem_utm: str, outlet_xy, out_png: str, candidates=None) -> str
     what you see is what it will delineate on. The nominal outlet (and any
     candidate cells) are marked, to judge whether the coordinate sits on a real
     channel before committing.
+
+    ``outlet_xy`` may be ``None``: reveal's first job is to *find* the channel,
+    which comes before having a coordinate to test.
     """
+    if outlet_xy is not None:
+        outlet_xy = check_outlet_in_dem(dem_utm, outlet_xy)
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -159,11 +177,13 @@ def reveal_rivers(dem_utm: str, outlet_xy, out_png: str, candidates=None) -> str
                  extent=ext, origin="upper")
     ax[1].set_title("log10 flow accumulation (rivers)")
     for a in ax:
-        a.plot(*outlet_xy, "rv", ms=12, mec="w", label="nominal outlet")
+        if outlet_xy is not None:
+            a.plot(*outlet_xy, "rv", ms=12, mec="w", label="nominal outlet")
         for i, (cx, cy) in enumerate(candidates or []):
             a.plot(cx, cy, "g^", ms=11, mec="w",
                    label="candidate" if i == 0 else None)
-        a.legend(loc="upper right")
+        if outlet_xy is not None or candidates:
+            a.legend(loc="upper right")
         a.ticklabel_format(style="plain")
     fig.tight_layout()
     fig.savefig(out_png, dpi=120, bbox_inches="tight")
@@ -173,26 +193,38 @@ def reveal_rivers(dem_utm: str, outlet_xy, out_png: str, candidates=None) -> str
 
 # --- Step 5: preview the snap -----------------------------------------------
 
-def preview_snap(dem_utm: str, outlet_xy, min_acc_cells: int = 5000) -> dict:
+def preview_snap(dem_utm: str, outlet_xy, min_acc_cells: int = 5000,
+                 max_snap_cells: int | None = DEFAULT_MAX_SNAP_CELLS) -> dict:
     """Report where ``outlet_xy`` snaps, and how much drainage that cell holds.
 
     Same snap terrain.py uses (nearest cell with accumulation > threshold), so
     the result confirms the pour point lands on the main stem before the full
     run. Raise the threshold if it snaps to a puddle; lower it if it jumps to
     the wrong river.
+
+    The snap is a nearest-neighbour search with no upper bound on distance, so
+    it always returns *something*. ``max_snap_cells`` bounds it (enforced in
+    :func:`terrain.snap_outlet`, so ``build_terrain`` gets the same guard): a
+    coordinate digitised off the channel moves a few cells, and anything further
+    is a wrong coordinate rather than a small offset. Pass ``None`` to disable.
     """
+    outlet_xy = check_outlet_in_dem(dem_utm, outlet_xy)
+
     grid, dem = T.load_grid(dem_utm)
     cond = T.condition_dem(grid, dem)
     fdir = T.flow_direction(grid, cond)
     acc = T.flow_accumulation(grid, fdir)          # keep as Raster for the snap
-    snapped = T.snap_outlet(grid, acc, outlet_xy, min_acc_cells=min_acc_cells)
+    snapped = T.snap_outlet(grid, acc, outlet_xy, min_acc_cells=min_acc_cells,
+                            max_snap_cells=max_snap_cells)
 
     tr = dem.affine
     fc, fr = (~tr) * snapped
     up = int(np.asarray(acc)[int(fr), int(fc)])
     cell_area = abs(tr.a * tr.e)
+    moved = float(np.hypot(snapped[0] - outlet_xy[0], snapped[1] - outlet_xy[1]))
     return {"nominal": tuple(float(v) for v in outlet_xy),
             "snapped": tuple(float(v) for v in snapped),
+            "snap_distance_m": moved,
             "upstream_cells": up,
             "upstream_km2": up * cell_area / 1e6,
             "min_acc_cells": int(min_acc_cells)}
@@ -267,18 +299,33 @@ def _build_arg_parser():
 
     s = sub.add_parser("reveal", help="plot rivers (accumulation + hillshade)")
     s.add_argument("--dem", required=True, help="projected DEM")
-    s.add_argument("--outlet", required=True, nargs=2, type=float, metavar=("X", "Y"))
+    s.add_argument("--outlet", nargs=2, type=float, metavar=("X", "Y"),
+                   help="optional; in the DEM's CRS. Omit to just find the channel.")
     s.add_argument("--out", required=True)
 
     s = sub.add_parser("snap", help="preview where an outlet snaps")
     s.add_argument("--dem", required=True, help="projected DEM")
-    s.add_argument("--outlet", required=True, nargs=2, type=float, metavar=("X", "Y"))
-    s.add_argument("--min-acc-cells", type=int, default=5000)
+    s.add_argument("--outlet", required=True, nargs=2, type=float, metavar=("X", "Y"),
+                   help="in the DEM's CRS -- use `outlet` to convert lon/lat")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--min-acc-km2", type=float,
+                   help="channel threshold as drainage area (resolution-independent)")
+    g.add_argument("--min-acc-cells", type=int)
+    s.add_argument("--max-snap-cells", type=int, default=DEFAULT_MAX_SNAP_CELLS,
+                   help="0 disables the snap-distance guard")
     return p
 
 
 def main(argv=None):
-    args = _build_arg_parser().parse_args(argv)
+    try:
+        _dispatch(_build_arg_parser().parse_args(argv))
+    except ValueError as exc:            # bad coordinate, not a bug: no traceback
+        import sys
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _dispatch(args):
     if args.cmd == "inspect":
         for k, v in inspect_dem(args.dem).items():
             print(f"{k:>10}: {v}")
@@ -291,14 +338,20 @@ def main(argv=None):
         x, y = tx.transform(args.lon, args.lat)
         print(f"{x:.1f} {y:.1f}  (EPSG:{args.epsg})")
     elif args.cmd == "reveal":
-        print(reveal_rivers(args.dem, tuple(args.outlet), args.out))
+        outlet = tuple(args.outlet) if args.outlet else None
+        print(reveal_rivers(args.dem, outlet, args.out))
     elif args.cmd == "snap":
-        info = preview_snap(args.dem, tuple(args.outlet),
-                            min_acc_cells=args.min_acc_cells)
+        if args.min_acc_km2 is not None:
+            min_acc = acc_cells_from_km2(args.dem, args.min_acc_km2)
+        else:
+            min_acc = args.min_acc_cells if args.min_acc_cells else 5000
+        info = preview_snap(args.dem, tuple(args.outlet), min_acc_cells=min_acc,
+                            max_snap_cells=args.max_snap_cells or None)
         print(f"min_acc={info['min_acc_cells']}: "
               f"{tuple(round(v) for v in info['nominal'])} -> "
               f"{tuple(round(v) for v in info['snapped'])}  "
-              f"({info['upstream_cells']} cells = {info['upstream_km2']:.1f} km2)")
+              f"({info['upstream_cells']} cells = {info['upstream_km2']:.1f} km2, "
+              f"snapped {info['snap_distance_m']:.0f} m)")
 
 
 if __name__ == "__main__":

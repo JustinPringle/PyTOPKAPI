@@ -35,7 +35,8 @@ pytest topkapi_setup/tests -q            # sanity: the full suite should be gree
 ## 1. Prepare a raw DEM  —  `preflight`
 
 Turns a raw download (often lat/lon SRTM) into a clean, projected DEM and helps
-you land the outlet on the real channel. Five composable steps plus a `run-all`.
+you land the outlet on the real channel. Six composable subcommands:
+`inspect`, `clip`, `reproject`, `outlet`, `reveal`, `snap`.
 
 ```bash
 # Inspect what you downloaded (CRS, size, nodata) before doing anything:
@@ -43,21 +44,41 @@ python -m topkapi_setup.preflight inspect  --dem ohlanga_srtm_4326.tif
 
 # Clip in the raw CRS, reproject to UTM36S at 30 m, then reveal the rivers:
 python -m topkapi_setup.preflight clip      --dem ohlanga_srtm_4326.tif \
-    --bbox <minx> <miny> <maxx> <maxy> --out clipped.tif
+    --box <W> <E> <S> <N> --out clipped.tif
+
 python -m topkapi_setup.preflight reproject --dem clipped.tif \
     --epsg 32736 --res 30 --out dem_utm36s.tif
+
 python -m topkapi_setup.preflight reveal    --dem dem_utm36s.tif --out rivers.png
 
-# Check where a candidate outlet snaps before committing to a full delineation:
-python -m topkapi_setup.preflight preview-snap --dem dem_utm36s.tif \
-    --outlet <easting> <northing> --min-acc-cells 5000
+# Put the mouth coordinate into the DEM's CRS. Longitude first, then latitude:
+python -m topkapi_setup.preflight outlet --lon 31.098846 --lat -29.701982
+#   -> 316075.4 6712724.4  (EPSG:32736)
+
+# Check where that outlet snaps before committing to a full delineation:
+python -m topkapi_setup.preflight snap --dem dem_utm36s.tif \
+    --outlet 316075 6712724 --min-acc-km2 5
 ```
 
 Why it matters: a raw SRTM tile is EPSG:4326 (degrees) with millions of cells,
 and a hand-picked mouth coordinate often lands a pixel or two off the channel on
 a low-accumulation bank cell. `reveal` (flow accumulation + hillshade) shows you
-the true main stem; `preview-snap` confirms the outlet snaps onto it. See
-`--help` on any subcommand for the full flag list, and `run-all` to chain them.
+the true main stem — it takes no outlet, because finding the channel comes
+first; `snap` then confirms the outlet lands on it. See `--help` on any
+subcommand for the full flag list. `preflight.run_all()` chains the whole
+sequence from Python (there is no `run-all` subcommand).
+
+**Outlet coordinates are in the DEM's CRS — metres, not degrees.** Degrees fed
+to a projected DEM are read as metres, land the point millions of metres away,
+and the nearest-neighbour snap still returns *a* channel cell: a clean run on
+the wrong river. `snap` now rejects an outlet outside the DEM, one that looks
+like decimal degrees, and one that has to move more than `--max-snap-cells`.
+Run `outlet` first and paste its output.
+
+**State the channel threshold as area, not cells.** `--min-acc-km2` is
+resolution-independent; `--min-acc-cells 5000` means 4.5 km² on a 30 m DEM and
+18 km² on a 60 m one, so a recipe written in cells changes meaning when the DEM
+does. Same drift as a mismatched `A_thres`.
 
 ---
 
@@ -78,7 +99,11 @@ python -m topkapi_setup.terrain \
 * `--a-thres` is the channel-initiation area in **m²** (start ~1e6 ≈ 1100
   30 m cells). It sets how dense the channel network is.
 * `terrain.py` auto-extracts the catchment from a larger DEM — no manual QGIS
-  clipping. It snaps the outlet onto the drainage line (`--min-acc-cells`).
+  clipping. It snaps the outlet onto the drainage line (`--min-acc-km2`, or
+  `--min-acc-cells` if you must; area is resolution-independent).
+* The outlet is rejected if it looks like degrees, falls outside the DEM, or has
+  to snap further than `--max-snap-cells` — the same guards `preflight snap`
+  applies, so a coordinate that passes preflight passes here.
 * The final step drives the **real** `create_file.cell_connectivity` to assert a
   single outlet before anything reaches the solver.
 

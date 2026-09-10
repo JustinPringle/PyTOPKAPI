@@ -31,13 +31,17 @@ def show_banner(ini_file, nb_cell, nb_time_step):
           'Running simulation from file: {}\n'.format(ini_file),
           '\r===============================================================\n')
 
-def _create_dataset(h5file, grp_name, dset_name, shape, units):
+def _create_dataset(h5file, grp_name, dset_name, shape, units, dtype='f4'):
     """Create HDF5 dataset if it doesn't exist.
+
+    `dtype` is passed explicitly: h5py deprecated the implicit default and
+    'f4' is the value it has always used here, so results are unchanged.
 
     """
     if '{}/{}'.format(grp_name, dset_name) not in h5file:
         dset = h5file.create_dataset('{}/{}'.format(grp_name, dset_name),
-                               shape, maxshape=(None, None), compression='gzip')
+                                     shape, dtype=dtype,
+                                     maxshape=(None, None), compression='gzip')
 
         dset.attrs['units'] = units
 
