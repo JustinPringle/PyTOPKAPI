@@ -313,40 +313,37 @@ def run(ini_file='TOPKAPI.ini',
     h5file.close()
 
 def _solve_cell(params):
-    """Core calculations for a model cell.
+    """Core calculations for a model cell, keyed by a parameter dict.
+
+    A thin adapter over `_solve_cell_core`, kept for the parallel path,
+    which assembles its arguments as a dict. The serial path calls the
+    core directly: building and unpacking a thirty-key dict once per cell
+    per timestep is a measurable share of a catchment-scale run.
 
     """
-    Dt = params['Dt']
-    rain_depth = params['rain_depth']
-    psi = params['psi']
-    eff_theta = params['eff_theta']
-    eff_sat = params['eff_sat']
-    Ks = params['Ks']
-    X = params['X']
-    soil_upstream_inflow = params['soil_upstream_inflow']
-    b_s = params['b_s']
-    alpha_s = params['alpha_s']
-    Vs0 = params['Vs0']
-    solve_s = params['solve_s']
-    Vsm = params['Vsm']
-    b_o = params['b_o']
-    alpha_o = params['alpha_o']
-    Vo0 = params['Vo0']
-    solve_o = params['solve_o']
-    channel_flag = params['channel_flag']
-    W = params['W']
-    Xc = params['Xc']
-    channel_upstream_inflow = params['chan_up_inflow']
-    Kc = params['Kc']
-    ETr = params['ETr']
-    b_c = params['b_c']
-    alpha_c = params['alpha_c']
-    Vc0 = params['Vc0']
-    solve_c = params['solve_c']
-    ET0 = params['ET0']
-    external_flow_flag = params['external_flow_flag']
-    external_flow = params['external_flow']
+    return _solve_cell_core(
+        params['Dt'], params['rain_depth'], params['psi'],
+        params['eff_theta'], params['eff_sat'], params['Ks'], params['X'],
+        params['soil_upstream_inflow'], params['b_s'], params['alpha_s'],
+        params['Vs0'], params['solve_s'], params['Vsm'], params['b_o'],
+        params['alpha_o'], params['Vo0'], params['solve_o'],
+        params['channel_flag'], params['W'], params['Xc'],
+        params['chan_up_inflow'], params['Kc'], params['ETr'],
+        params['b_c'], params['alpha_c'], params['Vc0'], params['solve_c'],
+        params['ET0'], params['external_flow_flag'], params['external_flow'])
 
+
+def _solve_cell_core(Dt, rain_depth, psi, eff_theta, eff_sat, Ks, X,
+                     soil_upstream_inflow, b_s, alpha_s, Vs0, solve_s, Vsm,
+                     b_o, alpha_o, Vo0, solve_o, channel_flag, W, Xc,
+                     channel_upstream_inflow, Kc, ETr, b_c, alpha_c, Vc0,
+                     solve_c, ET0, external_flow_flag, external_flow):
+    """Core calculations for a model cell.
+
+    The body is unchanged from the dict-keyed version; only the way the
+    arguments arrive is different.
+
+    """
     ## ======================== ##
     ## ===== INFILTRATION ===== ##
     ## ======================== ##
@@ -509,72 +506,24 @@ def _serial_execute(model_params):
                 channel_upstream_inflow = Qc_out[li_cell_up[cell]]
 
                 if cell == cell_external_flow:
-                    cell_params = {'Dt': Dt,
-                                  'rain_depth': rainfall_forcing[t, cell],
-                                  'psi': psi[cell],
-                                  'eff_theta': eff_theta[cell],
-                                  'eff_sat': eff_sat[cell],
-                                  'Ks': Ks[cell],
-                                  'X': X,
-                                  'soil_upstream_inflow': soil_upstream_inflow,
-                                  'b_s': b_s[cell],
-                                  'alpha_s': alpha_s,
-                                  'Vs0': Vs0[cell],
-                                  'solve_s': solve_s,
-                                  'Vsm': Vsm[cell],
-                                  'b_o': b_o[cell],
-                                  'alpha_o': alpha_o,
-                                  'Vo0': Vo0[cell],
-                                  'solve_o': solve_o,
-                                  'channel_flag': channel_flag[cell],
-                                  'W': W[cell],
-                                  'Xc': Xc[cell],
-                                  'chan_up_inflow': channel_upstream_inflow,
-                                  'Kc': Kc[cell],
-                                  'ETr': ETr_forcing[t, cell],
-                                  'b_c': b_c[cell],
-                                  'alpha_c': alpha_c,
-                                  'Vc0': Vc0[cell],
-                                  'solve_c': solve_c,
-                                  'ET0': ET0_forcing[t, cell],
-                                  'external_flow_flag': True,
-                                  'external_flow': external_flow_records[t]}
+                    external_flow_flag = True
+                    external_flow_value = external_flow_records[t]
                 else:
-                    cell_params = {'Dt': Dt,
-                                  'rain_depth': rainfall_forcing[t, cell],
-                                  'psi': psi[cell],
-                                  'eff_theta': eff_theta[cell],
-                                  'eff_sat': eff_sat[cell],
-                                  'Ks': Ks[cell],
-                                  'X': X,
-                                  'soil_upstream_inflow': soil_upstream_inflow,
-                                  'b_s': b_s[cell],
-                                  'alpha_s': alpha_s,
-                                  'Vs0': Vs0[cell],
-                                  'solve_s': solve_s,
-                                  'Vsm': Vsm[cell],
-                                  'b_o': b_o[cell],
-                                  'alpha_o': alpha_o,
-                                  'Vo0': Vo0[cell],
-                                  'solve_o': solve_o,
-                                  'channel_flag': channel_flag[cell],
-                                  'W': W[cell],
-                                  'Xc': Xc[cell],
-                                  'chan_up_inflow': channel_upstream_inflow,
-                                  'Kc': Kc[cell],
-                                  'ETr': ETr_forcing[t, cell],
-                                  'b_c': b_c[cell],
-                                  'alpha_c': alpha_c,
-                                  'Vc0': Vc0[cell],
-                                  'solve_c': solve_c,
-                                  'ET0': ET0_forcing[t, cell],
-                                  'external_flow_flag': False,
-                                  'external_flow': None}
+                    external_flow_flag = False
+                    external_flow_value = None
 
                 Qs_out[cell], Qo_out[cell], Qc_out[cell], Q_down[cell], \
                 Vs1[cell], Vo1[cell], Vc1[cell], \
-                ETa[cell], ET_channel[cell] = \
-                                           _solve_cell(cell_params)
+                ETa[cell], ET_channel[cell] = _solve_cell_core(
+                    Dt, rainfall_forcing[t, cell], psi[cell],
+                    eff_theta[cell], eff_sat[cell], Ks[cell], X,
+                    soil_upstream_inflow, b_s[cell], alpha_s, Vs0[cell],
+                    solve_s, Vsm[cell], b_o[cell], alpha_o, Vo0[cell],
+                    solve_o, channel_flag[cell], W[cell], Xc[cell],
+                    channel_upstream_inflow, Kc[cell], ETr_forcing[t, cell],
+                    b_c[cell], alpha_c, Vc0[cell], solve_c,
+                    ET0_forcing[t, cell], external_flow_flag,
+                    external_flow_value)
 
         ####===================================####
         #### Affectation of new vector values  ####

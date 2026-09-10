@@ -9,7 +9,36 @@ and output of cells.
 
 """
 
+from math import isfinite
+
 import numpy as np
+
+
+def _close(a, b, rtol=1.e-5, atol=1.e-8):
+    """Scalar stand-in for ``np.isclose``, without the array machinery.
+
+    ``np.isclose`` builds arrays, opens an errstate context and runs three
+    ufunc reductions on its way to comparing two Python floats.  That costs
+    about 12 microseconds a call; this costs about 0.05.  It is called
+    twice per cell per timestep, so on a catchment-scale run the array
+    version is the majority of the wall clock.
+
+    The arithmetic is numpy's, operation for operation and in the same
+    order, so the answer is bit-identical:
+
+    - both arguments finite: ``abs(a - b) <= atol + rtol * abs(b)``;
+    - either not finite: plain equality, so NaN is close to nothing and
+      an infinity is close only to the same infinity.
+
+    Anything that is not a real scalar is handed back to numpy.
+
+    """
+    try:
+        if isfinite(a) and isfinite(b):
+            return abs(a - b) <= (atol + rtol * abs(b))
+        return a == b
+    except TypeError:
+        return np.isclose(a, b, rtol=rtol, atol=atol)
 
 ##        ROUTINES FOR SOIL STORE
 #```````````````````````````````````````````
@@ -161,7 +190,7 @@ def Qout_computing(V_t0, V_t1_prim, a, Dt):
     """
     b = (V_t1_prim - V_t0)/Dt
 
-    if np.isclose(a, b):
+    if _close(a, b):
         Qout = 0
     else:
         Qout = a - b

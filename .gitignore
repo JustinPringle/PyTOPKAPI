@@ -43,7 +43,11 @@ docs/build/
 # Several SA layers (Land Type, DWS flow, WWTW records) are licence-
 # restricted and must NOT be committed. Keep raw data out of the repo;
 # commit only configs and manifests. Adjust these paths to taste.
-projects/*
+projects/*/results_60/*.h5
+projects/*/results_60/*.png
+projects/*/figs/terrain/
+projects/*/soil_60/
+projects/*/terrain_60/
 projects/*/data/
 projects/*/terrain/
 projects/*/soil/
@@ -58,3 +62,9 @@ projects/*/*.ini
 example_simulation/.DS_Store
 # NOTE: example_simulation/results/ is deliberately NOT ignored — it is
 # the committed regression fixture for the Liebenbergsvlei example.
+# speed-up session artefacts
+*.prof
+batch_identity_check/
+fac_ks_sweep.h5
+fac_ks_sweep_manifest.json
+sweep8.h5
