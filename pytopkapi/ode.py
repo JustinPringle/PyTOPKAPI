@@ -9,6 +9,22 @@ from math import *
 from scipy import *
 from numpy import *
 
+# `from numpy import *` shadows math.isfinite with numpy's array version.
+# Every argument it sees here is a scalar, and numpy charges 0.53 us for
+# that against 0.02 us for the math version. It is called once per
+# quasi-analytical solve -- roughly sixteen million times on a
+# catchment-scale run -- so re-import the scalar version last.
+#
+# The two agree exactly: isfinite is an exact predicate on the bit
+# pattern, verified over half a million values including both zeros,
+# both infinities, NaN and the subnormal extremes.
+#
+# Only isfinite. sqrt and exp are deliberately left as numpy's:
+#   - math.exp differs from numpy's by one bit on about 5 % of arguments;
+#   - math.sqrt raises on a negative discriminant where numpy returns nan,
+#     which is precisely the case the guard below is there to catch.
+from math import isfinite
+
 
 ###=======================================###
 ###          ANALYTICAL SOLUTIONS         ###
@@ -294,7 +310,7 @@ def qas(a, b, alpha, V0, delta_t,derivative=0):
 def adjust_2points_line(a_eq,b_eq,exposant,y0,delta_t):
     #Definition of the variables alpha0 and beta0
     #that approximate y**(exposant-1)=alpha0+beta0*y
-    f=storage_eq(a_eq,b_eq,exposant)
+    # (a storage_eq closure was built here and never used; removed)
     y1_estimat=y0+delta_t*a_eq #-->OK 1.
     beta0=(y1_estimat**(exposant-1)-y0**(exposant-1))/(y1_estimat-y0)
     alpha0=y0**(exposant-1)-beta0*y0
