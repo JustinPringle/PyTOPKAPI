@@ -1,0 +1,201 @@
+{
+  "created_utc": "2026-09-10T07:39:16+00:00",
+  "entries": {
+    "cell_param_60.dat": {
+      "kind": "bytes",
+      "n_byte": 4127359,
+      "path": "projects/umhlanga/cell_param_60.dat",
+      "role": "input",
+      "sha256": "dcc77e8d22741b4eb25aa3108805e02013610499cc77f0e9e713b2d147f4be40"
+    },
+    "global_param.dat": {
+      "kind": "bytes",
+      "n_byte": 161,
+      "path": "projects/umhlanga/global_param.dat",
+      "role": "input",
+      "sha256": "e78b1256ca417b2287356e548c0a542a5be65b0657c39b3fe1a87422615016f8"
+    },
+    "rainfields_60.h5": {
+      "attrs": {},
+      "datasets": {
+        "/ohlanga_jan2025/rainfall": {
+          "dtype": "<f4",
+          "sha256": "37ec6eafe1c20027bcd3acb89498d711e4ee13578f3829575b242f6664cc2592",
+          "shape": [
+            742,
+            22670
+          ],
+          "stats": {
+            "max": 18.228384017944336,
+            "min": 0.0,
+            "n_nonfinite": 0,
+            "n_value": 16821140,
+            "sum": 3690379.036862137
+          }
+        }
+      },
+      "kind": "hdf5",
+      "path": "projects/umhlanga/forcing/rainfields_60.h5",
+      "role": "input"
+    },
+    "results": {
+      "attrs": {
+        "pytopkapi_git_revision": "8cd0da4dd4d5cc24172deb181e21e488b11b4d97",
+        "pytopkapi_version": "0.5.0",
+        "title": "PyTOPKAPI simulation"
+      },
+      "datasets": {
+        "/Channel/Ec_out": {
+          "dtype": "<f4",
+          "sha256": "b2505297fb248f7cfb26024e72cdbdd43fca747b7849de933f830c56b7fa1023",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 2.1747326850891113,
+            "min": -0.0,
+            "n_nonfinite": 0,
+            "n_value": 16843810,
+            "sum": 93234.03503386243
+          }
+        },
+        "/Channel/Qc_out": {
+          "dtype": "<f4",
+          "sha256": "9c9304fd3adc35f3c3987e244cc96ec8d02a382d53dcc7c298e562cbc1802577",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 31.77035140991211,
+            "min": 0.0,
+            "n_nonfinite": 0,
+            "n_value": 16843810,
+            "sum": 747107.3266415849
+          }
+        },
+        "/Channel/V_c": {
+          "dtype": "<f4",
+          "sha256": "b5047eead4954e6a7c19d12b8393e7038ab24db9bd32e414dac496c4223bb984",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 3157.495849609375,
+            "min": 0.0,
+            "n_nonfinite": 0,
+            "n_value": 16843810,
+            "sum": 103894422.28207338
+          }
+        },
+        "/ET_out": {
+          "dtype": "<f4",
+          "sha256": "9216806a8cc396c4885f9bd6d04c8be8343b7e6afabc4193da0a30188515ac30",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 0.7995496988296509,
+            "min": 0.0,
+            "n_nonfinite": 0,
+            "n_value": 16843810,
+            "sum": 417375.7979198538
+          }
+        },
+        "/Overland/Qo_out": {
+          "dtype": "<f4",
+          "sha256": "30e5dab3247868b426a0b37ef2e038119852ae2862d1972c2652e2438ca53ad3",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 2.6284799575805664,
+            "min": 0.0,
+            "n_nonfinite": 22670,
+            "n_value": 16843810,
+            "sum": 27475.201265598822
+          }
+        },
+        "/Overland/V_o": {
+          "dtype": "<f4",
+          "sha256": "b6b734af0ec9ba154c2d9b50a7d61c1d08ad852ad5fbe995c48d423b0c4ac826",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 2148.916259765625,
+            "min": 0.0,
+            "n_nonfinite": 0,
+            "n_value": 16843810,
+            "sum": 39273803.767383605
+          }
+        },
+        "/Q_down": {
+          "dtype": "<f4",
+          "sha256": "489558986327afc01f8edbb6db18f4af73383b8c36c76aa55dc536a2950bf145",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 2.430206775665283,
+            "min": 0.0,
+            "n_nonfinite": 22670,
+            "n_value": 16843810,
+            "sum": 68566.88223664332
+          }
+        },
+        "/Soil/Qs_out": {
+          "dtype": "<f4",
+          "sha256": "1019c85916f31180824c2b5aa0721a7b921cb6b00732b9b459e867fed8cc7eb3",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 1.596893548965454,
+            "min": 0.0,
+            "n_nonfinite": 22670,
+            "n_value": 16843810,
+            "sum": 45447.46015125558
+          }
+        },
+        "/Soil/V_s": {
+          "dtype": "<f4",
+          "sha256": "7b659bd164bca014b8c7b7bbee2f5d1e2947b3ac6eecca229b564ef41faa543d",
+          "shape": [
+            743,
+            22670
+          ],
+          "stats": {
+            "max": 1663.7760009765625,
+            "min": 1.636534571647644,
+            "n_nonfinite": 0,
+            "n_value": 16843810,
+            "sum": 2187882940.1396017
+          }
+        }
+      },
+      "kind": "hdf5",
+      "path": "projects/umhlanga/results_60/simulation_20250101_20250131.h5",
+      "role": "results"
+    }
+  },
+  "git": {
+    "branch": "pytopkapi_speed_up",
+    "commit": "27e1d7f23e4ce22ec25a43f0c0cfc351a268765f",
+    "dirty": true
+  },
+  "label": "reference run, 27e1d7f, 60 m grid",
+  "runtime": {
+    "h5py": "3.16.0",
+    "numpy": "2.5.2",
+    "python": "3.12.12"
+  },
+  "schema_version": 1
+}
